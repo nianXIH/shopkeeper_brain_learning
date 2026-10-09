@@ -1,12 +1,16 @@
-import re
+import re, time, base64
+from collections import deque
 from dataclasses import dataclass
 from logging import Logger
 from typing import List,Dict,Tuple,Set,Optional,Deque
 from pathlib import Path
 
+from openai import OpenAI
+
 from knowledge.processor.import_processor.base import BaseNode, setup_logging, T
 from knowledge.processor.import_processor.state import ImportGraphState
 from knowledge.processor.import_processor.exceptions import StateFieldError,FileProcessingError
+from knowledge.utils.client.ai_clients import AIClients
 
 # 模块级预编译一次
 _HEADING_RE = re.compile(r"^#{1,6}\s+")
@@ -181,7 +185,7 @@ class _ImageScanner:
             # 上文标题的索引作为起始索引(取不到)
             head,prev_index = self._find_heading_up(md_lines,md_idx)
             pre_lines = md_lines[prev_index+1:md_idx]
-            pre_context = self.extract_limited_context(pre_lines,img_content_length,direction="front")
+            pre_context = self._extract_limited_context(pre_lines,img_content_length,direction="front")
 
             # 下文
             # 下文标题的索引作为结束索引
@@ -296,6 +300,119 @@ class _VLMSummarizer:
         self.logger = logger
         self.requests_per_minute = requests_per_minute
 
+    def _summarize_all(self, document_name:str, img_info_list:List[ImageInfo], vl_model:str)->Dict[str,str]:
+        """
+        职责：为所有图片生成摘要
+        Args:
+            document_name: 文档的名字
+            img_info_list: 所有图片信息
+            vl_model: vlm模型名字
+
+        Returns:
+            Dict[str,str]:{"img_name":"summary"}
+
+        """
+        summaries = {}
+        request_timestamps: Deque[float] = deque()
+        # 1. 获取VLM客户端
+        try:
+            vlm_client = AIClients.get_vlm_client()
+        except Exception as e:
+            for img_info in img_info_list:
+                summaries[img_info.name] = "暂无摘要"
+            return summaries
+
+        # 2.调用VLM 为每一张图片生成摘要
+        for img_info in img_info_list:
+            # 测试一下
+            self._enforce_rate_limit(request_timestamps,self.requests_per_minute)
+            summaries[img_info.name] = self._summary_one(document_name,img_info,vlm_client,vl_model)
+        self.logger.info(f"生成了{len(summaries)}张图片的摘要")
+
+        return summaries
+
+    def _summary_one(self, document_name: str, img_info: ImageInfo, vlm_client: OpenAI, vl_model: str) -> str:
+        """
+        调用VLM模型为当前图片生成摘要信息
+        Args:
+            img_info: 当前图片信息
+            vlm_client: vlm客户端
+            vl_model: vlm模型名
+
+        Returns:
+         str:图片摘要
+
+        """
+        # 1. 构造VLM需要的上下文（标题名、上文内容、下文内容）
+        parts = [p for p in (img_info.imag_context.head, img_info.imag_context.pre_text, img_info.imag_context.post_text) if p is not None]
+
+        # 2. 构建最终的上下文
+        final_context = "\n\n".join(parts) if parts else "暂无上下文"
+
+        # 3. 根据图片地址获取到图片的内容（二进制字节流）---文本协议认识（base64编码）--->解码（‘utf-8’）--->字符串（文本协议能传输） ---- 根据收到字符串解码（二进制字节流 还原图片内容）
+        try:
+            with  open(img_info.path, 'rb') as f:
+                img_data = base64.b64encode(f.read()).decode('utf-8')
+        except IOError as e:
+            self.logger.error(f"读取图片文件{img_info.path} 内容失败: {e}")
+            return "暂无图片描述"
+
+        # 4. 利用vlm客户端调用VLM模型
+        try:
+            resp = vlm_client.chat.completions.create(
+                model=vl_model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"任务：为Markdown文档中的图片生成一个简短的中文标题。\n"
+                                f"背景信息：\n"
+                                f"  1. 所属文档标题：\"{document_name}\"\n"
+                                f"  2. 图片上下文：{final_context}\n"
+                                f"请结合图片内容和上述上下文信息，"
+                                f"用中文简要总结这张图片的内容，"
+                                f"生成一个精准的中文标题摘要（不要包含图片二字）。"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_data}"
+                            },
+                        },
+                    ],
+                }],
+            )
+            return resp.choices[0].message.content.strip()
+
+        except Exception as e:
+            self.logger.error(f"图片摘要生成失败 {img_info.path}: {e}")
+            return "暂无图片描述"
+
+    def _enforce_rate_limit(self, timestamps: Deque[float],
+            max_requests: int,
+            window: int = 60
+    ):
+        now = time.time()
+        while timestamps and (now - timestamps[0]) > window:
+            timestamps.popleft()
+
+        if len(timestamps) >= max_requests:
+            sleep_dur = window - (now - timestamps[0])
+            if sleep_dur > 0:
+                self.logger.info(
+                    f"达到速率限制，暂停 {sleep_dur:.2f} 秒..."
+                )
+                time.sleep(sleep_dur)
+            now = time.time()
+            while timestamps and now - timestamps[0] >= window:
+                timestamps.popleft()
+
+        timestamps.append(now)
+
+
 class _ImageUploader:
     """
     主要职责：
@@ -314,7 +431,7 @@ class MarkDownToImgNode(BaseNode):
 
     """
     def __init__(self):
-        super.__init__()
+        super().__init__()
         self._md_file_handler = _MdFileHandler(self.logger,self.name)
         self._img_scaner = _ImageScanner(self.logger)
         self._vlm_summerizer = _VLMSummarizer(self.logger,self.config.requests_per_minute)
@@ -343,5 +460,17 @@ class MarkDownToImgNode(BaseNode):
                                                                         config.image_extensions,
                                                                         config.img_content_length)
 
+        # 3. 操作_vlm_summarizer
+        summaries:Dict[str, str] = self._vlm_summerizer._summarize_all(md_path_obj.stem,img_info_list,config.vl_model)
 
+        # 4. 操作_img_uploader
 
+        return state
+
+if __name__ == '__main__':
+    setup_logging()
+    md_img_node = MarkDownToImgNode()
+    init_state = {
+        "md_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\temp_dir\万用表的使用\hybrid_auto\万用表的使用.md"
+    }
+    md_img_node.process(init_state)
