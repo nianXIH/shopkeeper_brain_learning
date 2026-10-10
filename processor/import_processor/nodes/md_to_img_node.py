@@ -462,7 +462,7 @@ class MarkDownToImgNode(BaseNode):
         super().__init__()
         self._md_file_handler = _MdFileHandler(self.logger,self.name)
         self._img_scaner = _ImageScanner(self.logger)
-        self._vlm_summerizer = _VLMSummarizer(self.logger,self.config.requests_per_minute)
+        self._vlm_summarizer = _VLMSummarizer(self.logger,self.config.requests_per_minute)
         self._img_uploader = _ImageUploader(self.logger)
 
     name = "md_to_img_node"
@@ -489,7 +489,9 @@ class MarkDownToImgNode(BaseNode):
                                                                         config.img_content_length)
 
         # 3. 操作_vlm_summarizer
-        summaries:Dict[str, str] = self._vlm_summerizer._summarize_all(md_path_obj.stem,img_info_list,config.vl_model)
+        self.log_step("step3", "利用VLM提取摘要")
+        summaries: Dict[str, str] = self._vlm_summarizer._summary_all(md_path_obj.stem, img_info_list,
+                                                                      config.vl_model)
 
         # 4. 操作_img_uploader
 
