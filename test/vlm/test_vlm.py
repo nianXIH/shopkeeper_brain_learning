@@ -10,7 +10,7 @@ client = OpenAI(
 
 # 创建聊天完成请求
 completion = client.chat.completions.create(
-    model="qwen3-vl-flash",
+    model=os.getenv("VL_MODEL", "qwen3.8-flash"),
     messages=[
         {
             "role": "user",
@@ -24,7 +24,9 @@ completion = client.chat.completions.create(
                 {"type": "text", "text": "这道题怎么解答？"},
             ]
         }
-    ]
+    ],
+    # 关闭思考模式
+    extra_body={"enable_thinking": False},
 )
 
 print(completion.choices[0].message.content)

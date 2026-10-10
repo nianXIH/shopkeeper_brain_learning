@@ -1,2 +1,10 @@
 .env
 requirements.txt
+
+# Python 运行产物
+__pycache__/
+*.py[cod]
+.venv/
+
+# MinerU 解析产物（中间 json、md、图片），由 pdf_to_md 节点在本地生成
+processor/import_processor/nodes/temp/output/

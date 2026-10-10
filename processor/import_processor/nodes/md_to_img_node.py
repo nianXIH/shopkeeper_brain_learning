@@ -127,28 +127,37 @@ class _ImageScanner:
 
         """
         img_info_list = []
+        scanned_cnt = 0
+        skipped_cnt = 0
         # 1.遍历图片目录，得到有效的图片文件
         for img_path in img_dir_obj.iterdir():
+            scanned_cnt += 1
             # 1.1 过滤掉子目录
             if not img_path.is_file():
-                self.logger.error(f"{img_path}不是一个有效文件")
+                self.logger.debug(f"{img_path}不是一个有效文件，跳过")
+                skipped_cnt += 1
                 continue
 
             # 1.2 过滤掉非图片文件
             if not img_path.suffix in image_extensions:
-                self.logger.error(f"{img_path}不是允许的图片后缀格式")
+                self.logger.debug(f"{img_path}不是允许的图片后缀格式，跳过")
+                skipped_cnt += 1
                 continue
 
             # 1.3 获取图片的上下文内容
+            # 未被MD引用的图片（如MinerU产出的表格截图 page_x_table_y.jpg）属于正常情况，
+            # 其内容已以Markdown表格文本形式存在于MD中，这里只做跳过处理，不视为错误
             ctx = self._find_context(img_path.name, md_content, img_content_length)
             if not ctx:
-                self.logger.error(f"{img_path}的上下文内容获取失败")
+                self.logger.info(f"{img_path.name}未在MD中找到引用，跳过（可能是未被MD引用的表格截图）")
+                skipped_cnt += 1
                 continue
 
             # 1.4 封装ImageInfo对象并且放到容器中
             img_info_list.append(ImageInfo(name=img_path.name, path=str(img_path), imag_context=ctx))
 
-        self.logger.info(f"MD中找到{len(img_info_list)}张有效的图片引用")
+        self.logger.info(
+            f"图片目录共扫描{scanned_cnt}个文件，MD中有效图片引用{len(img_info_list)}张，跳过{skipped_cnt}个")
 
         # 2,最终返回
         return img_info_list
@@ -296,9 +305,24 @@ class _VLMSummarizer:
     主要根据每一张图片信息以及每一张图片的上下文信息，生成对应该图片的摘要信息
     """
 
+    # 占位摘要：不代表VLM真实生成的结果，统计成功数量时需要排除
+    _PLACEHOLDER_NO_SUMMARY = "暂无摘要"  # VLM客户端不可用
+    _PLACEHOLDER_NO_IMAGE = "暂无图片描述"  # 读图失败或VLM调用失败
+    _PLACEHOLDER_SUMMARIES = (_PLACEHOLDER_NO_SUMMARY, _PLACEHOLDER_NO_IMAGE)
+
     def __init__(self, logger: Logger, requests_per_minute: int):
         self.logger = logger
         self.requests_per_minute = requests_per_minute
+
+    def _log_summary_count(self, summaries: Dict[str, str]) -> None:
+        """
+        按统一口径统计摘要生成结果：成功数量只计VLM真实产出的摘要，占位内容单独计数
+        Args:
+            summaries: 图片名到摘要的映射
+        """
+        total = len(summaries)
+        failed = sum(1 for v in summaries.values() if v in self._PLACEHOLDER_SUMMARIES)
+        self.logger.info(f"生成了{total - failed}张图片的摘要（共{total}张，其中{failed}张为占位）")
 
     def _summarize_all(self, document_name:str, img_info_list:List[ImageInfo], vl_model:str)->Dict[str,str]:
         """
@@ -318,8 +342,10 @@ class _VLMSummarizer:
         try:
             vlm_client = AIClients.get_vlm_client()
         except Exception as e:
+            self.logger.warning(f"VLM客户端获取失败，所有图片摘要置为占位: {e}")
             for img_info in img_info_list:
-                summaries[img_info.name] = "暂无摘要"
+                summaries[img_info.name] = self._PLACEHOLDER_NO_SUMMARY
+            self._log_summary_count(summaries)
             return summaries
 
         # 2.调用VLM 为每一张图片生成摘要
@@ -327,7 +353,7 @@ class _VLMSummarizer:
             # 测试一下
             self._enforce_rate_limit(request_timestamps,self.requests_per_minute)
             summaries[img_info.name] = self._summary_one(document_name,img_info,vlm_client,vl_model)
-        self.logger.info(f"生成了{len(summaries)}张图片的摘要")
+        self._log_summary_count(summaries)
 
         return summaries
 
@@ -355,7 +381,7 @@ class _VLMSummarizer:
                 img_data = base64.b64encode(f.read()).decode('utf-8')
         except IOError as e:
             self.logger.error(f"读取图片文件{img_info.path} 内容失败: {e}")
-            return "暂无图片描述"
+            return self._PLACEHOLDER_NO_IMAGE
 
         # 4. 利用vlm客户端调用VLM模型
         try:
@@ -384,12 +410,14 @@ class _VLMSummarizer:
                         },
                     ],
                 }],
+                # 关闭思考模式，直接输出摘要结果
+                extra_body={"enable_thinking": False},
             )
             return resp.choices[0].message.content.strip()
 
         except Exception as e:
             self.logger.error(f"图片摘要生成失败 {img_info.path}: {e}")
-            return "暂无图片描述"
+            return self._PLACEHOLDER_NO_IMAGE
 
     def _enforce_rate_limit(self, timestamps: Deque[float],
             max_requests: int,
@@ -469,8 +497,9 @@ class MarkDownToImgNode(BaseNode):
 
 if __name__ == '__main__':
     setup_logging()
+
     md_img_node = MarkDownToImgNode()
     init_state = {
-        "md_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\temp_dir\万用表的使用\hybrid_auto\万用表的使用.md"
+        "md_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\output\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn)\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn).md"
     }
     md_img_node.process(init_state)
