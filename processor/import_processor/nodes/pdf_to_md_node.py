@@ -1,5 +1,8 @@
 import subprocess
+import sys
+import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Tuple
 
@@ -97,19 +100,27 @@ class PdfToMdNode(BaseNode):
         # mineru -p input_path -o output_dir --source=local
 
         # 1. 定义cmd
-        output_md_path = self.get_md_path(import_file_path_obj, file_dir_obj)
+        # 关键点：
+        #   ① MinerU 4.x 中 `mineru parse` 是「文档库/Agent 阅读」工作流，图片只会输出成
+        #      定位符(doc:.../page:x/block:y)，不落地；必须用 `mineru-kit parse`。
+        #   ② `mineru-kit parse --format markdown` 会把图片内联成 base64，同样不生成 images/ 目录；
+        #      只有 `--format zip` 才会打包出 images/ 独立图片文件，因此这里用 zip，随后再解压。
+        file_stem = import_file_path_obj.stem
+        zip_output_dir = file_dir_obj / "output"
+        zip_output_dir.mkdir(parents=True, exist_ok=True)
         print("import_file_path_obj:", import_file_path_obj)
         print("file_dir_obj:", file_dir_obj)
-        print("output_md_path:", output_md_path)
+        print("zip_output_dir:", zip_output_dir)
 
         cmd = [
-            "mineru",
+            self._resolve_mineru_exe(),
             "parse",
             str(import_file_path_obj),
             "--pages", "all",
             "-o",
-            output_md_path,
-            "--remote"
+            str(zip_output_dir),
+            "--tier", "standard",
+            "--format", "zip"
         ]
 
         # 2. 利用子进程执行cmd命令(子进程解析的日志【正常日志和错误日志都要】)
@@ -132,27 +143,74 @@ class PdfToMdNode(BaseNode):
         # 4. 主线程等待子进程做完（状态码0：成功 反之失败）
         processed_result = proc.wait()
         end_time = time.time()
-        if processed_result == 0:
-            self.logger.info(f"MinerU解析成功，耗时{end_time - start_time}秒")
-        else:
+        if processed_result != 0:
             self.logger.info(f"MinerU解析失败")
+            return processed_result
 
-        return processed_result
+        self.logger.info(f"MinerU解析成功，耗时{end_time - start_time}秒")
 
+        # 5. 解压 zip，得到 <output>/<文件名>/markdown.md 与同级的 images/ 目录
+        zip_path = zip_output_dir / f"{file_stem}.zip"
+        if not zip_path.exists():
+            self.logger.error(f"未找到MinerU解析结果压缩包：{zip_path}")
+            return 1
+
+        extract_dir = self._get_extract_dir(import_file_path_obj, file_dir_obj)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_dir)
+        self.logger.info(f"已解压MinerU解析结果到：{extract_dir}")
+
+        # 6. zip 内 md 固定名为 markdown.md，重命名为 <原文件名>.md，
+        #    便于下游节点用 md 文件名作为文档标题
+        extracted_md = extract_dir / "markdown.md"
+        final_md = extract_dir / f"{file_stem}.md"
+        if extracted_md.exists():
+            if final_md.exists():
+                final_md.unlink()
+            extracted_md.rename(final_md)
+
+        # 7. 清理中间产物 zip
+        zip_path.unlink(missing_ok=True)
+
+        return 0
+
+    def _resolve_mineru_exe(self) -> str:
+        """
+        定位 mineru-kit 可执行文件。
+        优先取当前 Python 解释器同级目录下的可执行文件（venv 未激活、Scripts 不在 PATH 时也能找到），
+        找不到再回退到 PATH 中的 mineru-kit。
+        """
+        exe_name = "mineru-kit.exe" if sys.platform == "win32" else "mineru-kit"
+        candidate = Path(sys.executable).parent / exe_name
+        if candidate.exists():
+            return str(candidate)
+        which = shutil.which("mineru-kit")
+        if which:
+            return which
+        # 最后兜底，交给系统在 PATH 中查找
+        return "mineru-kit"
+
+    def _get_extract_dir(self, import_file_path_obj: Path, file_dir_obj: Path) -> Path:
+        """
+        解析结果(zip)的解压目录：file_dir/output/<文件名>/
+        解压后该目录下为 markdown.md(会被重命名为 <文件名>.md) 与同级的 images/ 目录
+        """
+        return file_dir_obj / "output" / import_file_path_obj.stem
+    
     def get_md_path(self, import_file_path_obj: Path, file_dir_obj: Path) -> str:
         """
         获取解析后md的路径
         :param import_file_path_obj:
         :param file_dir_obj:
         :return:
-        md_path= D:\\develop\\develop\\workspace\\temp_dir\\万用表的使用\\hybrid_auto\\万用表的使用.md
-
-        Path:吉祥三包：name:全名[文件名字.后缀]   stem【文件名字，没有后缀】    suffix【文件的后缀】
+        md_path= <file_dir>/output/<文件名>/<文件名>.md（与 images/ 目录同级）
+    
+        Path:吉祥三宝：name:全名[文件名字.后缀]   stem【文件名字，没有后缀】    suffix【文件的后缀】
         """
         file_name = import_file_path_obj.stem
-
-        # 输出目录：file_dir/output/<文件名>.md（-o 必须是 .md 文件路径，不能传目录）
-        return str(file_dir_obj / "output" / f"{file_name}.md")
+    
+        return str(self._get_extract_dir(import_file_path_obj, file_dir_obj) / f"{file_name}.md")
 
 
 ##########################################
