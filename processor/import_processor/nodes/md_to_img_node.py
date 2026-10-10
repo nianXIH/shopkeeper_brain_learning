@@ -11,6 +11,7 @@ from knowledge.processor.import_processor.base import BaseNode, setup_logging, T
 from knowledge.processor.import_processor.state import ImportGraphState
 from knowledge.processor.import_processor.exceptions import StateFieldError,FileProcessingError
 from knowledge.utils.client.ai_clients import AIClients
+from knowledge.utils.client.storage_clients import StorageClients
 
 # 模块级预编译一次
 _HEADING_RE = re.compile(r"^#{1,6}\s+")
@@ -91,6 +92,23 @@ class _MdFileHandler:
 
         # 7.返回
         return md_content,md_path_obj,img_dir
+
+    def backup(self, md_path_obj: Path, new_md_content: str) -> None:
+        """
+        将更新后的md内容备份到同目录下的 xxx.backup.md，方便测试观察（不覆盖原始md）
+        Args:
+            md_path_obj:     原始md路径
+            new_md_content:  已经替换摘要与远程图片地址的新md内容
+
+        """
+        backup_path = md_path_obj.with_name(f"{md_path_obj.stem}.backup.md")
+        try:
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(new_md_content)
+            self.logger.info(f"新MD内容已备份到:{backup_path}")
+        except IOError as e:
+            # 备份只用于测试观察，失败不应中断主流程（新md已经通过state向下传递）
+            self.logger.error(f"MD文件:{backup_path.name} 备份失败: {e}")
 
 
 
@@ -324,7 +342,7 @@ class _VLMSummarizer:
         failed = sum(1 for v in summaries.values() if v in self._PLACEHOLDER_SUMMARIES)
         self.logger.info(f"生成了{total - failed}张图片的摘要（共{total}张，其中{failed}张为占位）")
 
-    def _summarize_all(self, document_name:str, img_info_list:List[ImageInfo], vl_model:str)->Dict[str,str]:
+    def _summary_all(self, document_name:str, img_info_list:List[ImageInfo], vl_model:str)->Dict[str,str]:
         """
         职责：为所有图片生成摘要
         Args:
@@ -419,6 +437,7 @@ class _VLMSummarizer:
             self.logger.error(f"图片摘要生成失败 {img_info.path}: {e}")
             return self._PLACEHOLDER_NO_IMAGE
 
+
     def _enforce_rate_limit(self, timestamps: Deque[float],
             max_requests: int,
             window: int = 60
@@ -441,6 +460,7 @@ class _VLMSummarizer:
         timestamps.append(now)
 
 
+
 class _ImageUploader:
     """
     主要职责：
@@ -450,6 +470,96 @@ class _ImageUploader:
 
     def __init__(self, logger: Logger):
         self.logger = logger
+
+    def upload_and_replace(self, object_dir_name: str, md_content: str, img_info_list: List[ImageInfo],
+                           summaries: Dict[str, str],
+                           minio_url: str, minio_bucket_name: str):
+        """
+        上传文件图片到minio并且更新md中的图片地址以及摘要
+        Args:
+            object_dir_name:  minio对象目录
+            md_content:       md的内容
+            img_info_list:    图片信息
+            summaries:        图片摘要
+            minio_url:        minio地址
+            minio_bucket_name: 桶名
+
+        Returns:
+            更新后的md内容
+
+        """
+
+        # 1. 上传
+        remote_urls = self._upload_all(object_dir_name,img_info_list,minio_url,minio_bucket_name)
+
+        # 2. 更新
+        md_content = self._update_md(md_content,summaries,remote_urls)
+
+        return md_content
+
+    def _upload_all(self,object_dir_name:str,img_info_list:List[ImageInfo],minio_url:str,minio_bucket_name:str)->Dict[str,str]:
+        remote_urls = {}
+
+        # 1. 得到MinIO客户端
+        try:
+            minio_client = StorageClients.get_minio_client()
+        except Exception as e:
+            for img_info in img_info_list:
+                remote_urls[img_info.name] = img_info.path
+            return remote_urls
+
+        # 2. 遍历上传每一个图片的信息
+        for img_info in img_info_list:
+            object_name = f"{object_dir_name}/{img_info.name}"
+            try:
+                # 2,1 上传图片到MinIO
+                minio_client.fput_object(bucket_name=minio_bucket_name,object_name=object_name,file_path=img_info.path)
+                # 2.2 拼装远程访问地址：{base_url}/{bucket}/{object_name}
+                remote_urls[img_info.name] = f"{minio_url}/{minio_bucket_name}/{object_name}"
+                self.logger.info(f"成功将图片{img_info.name}上传到MinIO中")
+            except Exception as e:
+                self.logger.warn(f"上传图片{img_info.name}到MinIO失败,利用本地图片地址做兜底: {e}")
+                remote_urls[img_info.name] = img_info.path
+
+        self.logger.info(f"获取到远程的{len(remote_urls)}张图片地址")
+        return remote_urls
+
+    def _update_md(self, md_content: str, summaries: Dict[str, str], remote_urls: Dict[str, str]) -> str:
+        """
+        更新md内容中的图片地址以及摘要
+        Args:
+            md_content:  md内容
+            summaries:   vlm生成的摘要
+            remote_urls: minio生成的url
+
+        Returns:
+            新md
+
+        """
+        # 利用正则寻找(捕获组：()一个捕获组：group(0) 将整个匹配到的内容放进去 group(1)：图片的摘要 group(2):图片地址)
+        pattern = re.compile(r"!\[(.*?)\]\((.*?)\)")
+
+        def replacer(match: re.Match) -> str:
+            """
+            替换图片地址以及摘要
+            Args:
+                match:正则寻找的匹配规则
+
+            Returns:
+                ![摘要](远程图片地址)
+            """
+
+            for img_name, img_summary in summaries.items():
+                origin_img_path = match.group(2)
+                img_name_in_md = Path(origin_img_path).name
+                if img_name == img_name_in_md:
+                    # 地址缺失时保持MD中原有的图片地址，避免KeyError中断整个节点
+                    remote_url = remote_urls.get(img_name, origin_img_path)
+                    return f"![{img_summary}]({remote_url})"
+            return match.group(0)
+
+        return pattern.sub(replacer, md_content)
+
 
 class MarkDownToImgNode(BaseNode):
     """
@@ -494,6 +604,16 @@ class MarkDownToImgNode(BaseNode):
                                                                       config.vl_model)
 
         # 4. 操作_img_uploader
+        self.log_step("step4", "上传文件到MinIO,且更新MD")
+        new_md_content = self._img_uploader.upload_and_replace(md_path_obj.stem, md_content, img_info_list,
+                                                               summaries,
+                                                               config.get_minio_base_url(),
+                                                               config.minio_bucket)
+
+        # 5. 备份调配
+        self._md_file_handler.backup(md_path_obj, new_md_content)
+
+        state['md_content'] = new_md_content
 
         return state
 
