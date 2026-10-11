@@ -62,8 +62,7 @@ class EntryNode(BaseNode):
 if __name__ == '__main__':
     entry_node = EntryNode()
     init_state = {
-        # "import_file_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn).pdf",
-        "import_file_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\output\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn)\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn).md",
+        "import_file_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn).pdf",
         "file_dir": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp"
     }
     result = entry_node.process(init_state)
