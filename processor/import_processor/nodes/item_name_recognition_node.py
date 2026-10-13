@@ -1,5 +1,5 @@
 from typing import List, Tuple, Dict, Any, Optional
-
+from pathlib import Path
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
@@ -7,7 +7,6 @@ from pymilvus import MilvusClient, DataType
 from knowledge.processor.import_processor.base import BaseNode, setup_logging, T
 from knowledge.processor.import_processor.state import ImportGraphState
 from knowledge.processor.import_processor.exceptions import StateFieldError, ValidationError
-from knowledge.test.bge.embedding.test_bge_m3 import bge_m3_ef
 from knowledge.utils.client.ai_clients import AIClients
 from knowledge.utils.client.storage_clients import StorageClients
 from knowledge.prompts.import_prompt import ITEM_NAME_SYSTEM_PROMPT, ITEM_NAME_USER_PROMPT_TEMPLATE
@@ -16,9 +15,9 @@ from knowledge.prompts.import_prompt import ITEM_NAME_SYSTEM_PROMPT, ITEM_NAME_U
 class ItemNameRecognitionNode(BaseNode):
     name = "item_name_recognition_node"
 
-    def process(self,state:ImportGraphState)->ImportGraphState:
+    def process(self, state: ImportGraphState) -> ImportGraphState:
         """
-        节点的处理逻辑入口
+        主要职责：
         1. 负责利用LLM提取商品的具体型号（名）
         2. 嵌入商品具体型号（名）
         3. 存储到Milvus中（MySQL：模糊查询的时候不会考虑语义）
@@ -26,6 +25,7 @@ class ItemNameRecognitionNode(BaseNode):
             state:
 
         Returns:
+
         """
 
         # 1. 参数校验
@@ -59,7 +59,7 @@ class ItemNameRecognitionNode(BaseNode):
         """
 
         # 1. 获取文档标题(商品具体型号[名]兜底)
-        file_title = state.get("file_title")
+        file_title = state.get('file_title')
 
         # 2. 判断文档标题
         if not file_title:
@@ -81,33 +81,33 @@ class ItemNameRecognitionNode(BaseNode):
         # 6. 返回
         return file_title, chunks, item_name_chunk_k
 
-    def _prepare_llm_context(self, chunks:List[Dict], item_name_chunk_k:int)->str:
+    def _prepare_llm_context(self, chunks: List[Dict], item_name_chunk_k: int) -> str:
         """
-        职责：准备LLM的上下文信息
+        准备商品名识别的上下文
         Args:
-            chunks: 切片列表
-            item_name_chunk_k: 辅助切片数
+            chunks: 该文档的所有切块
+            item_name_chunk_k: 准备使用的块数
 
         Returns:
-            str: LLM的上下文信息
+         上下文信息
         """
 
         # 1. 遍历
-        final_content = []
+        final_context = []
         for index, chunk in enumerate(chunks[:item_name_chunk_k]):
 
-            # 1.1 不是字典类型的直接跳过
-            if not isinstance(chunk,dict):
+            # 1.1 不是字典类型 直接过滤掉该块
+            if not isinstance(chunk, dict):
                 continue
 
             # 1.2 获取chunk的content
             content = chunk.get('content')
 
-            splice_context = f"【切片】- {index}- {content}"
+            splice_context = f"【切片】- f{index}- {content}"
 
-            final_content.append(splice_context)
+            final_context.append(splice_context)
 
-        return "\n".join(final_content)
+        return "\n".join(final_context)
 
     def _recognition_item_name(self, item_name_context: str, file_title: str) -> str:
 
@@ -144,20 +144,21 @@ class ItemNameRecognitionNode(BaseNode):
             self.logger.error(f"LLM提取商品名失败，降级使用文件标题{file_title}作为商品名: {str(e)}")
             return file_title
 
-    def _embedding_item_name(self,item_name:str)->Tuple[Optional[List],Optional[Dict[str,Any]]]:
+    def _embedding_item_name(self, item_name: str) -> Tuple[Optional[List], Optional[Dict[str, Any]]]:
         """
         商品名嵌入
         Args:
-            item_name:商品名
+            item_name: 商品名
 
         Returns:
-            稠密向量,稀疏向量
-
+          稠密向量,稀疏向量
         """
+
+        # 1. 获取到嵌入模型
         try:
-            bge_m3_client:BGEM3EmbeddingFunction = AIClients.get_bge_m3_client()
+            bge_m3_client: BGEM3EmbeddingFunction = AIClients.get_bge_m3_client()
         except ConnectionError as e:
-            self.logger.error(f"BGE M3 客户端创建失败: {str(e)}")
+            self.logger.error(f"BGE_M3嵌入模型客户端创建失败: {str(e)}")
             return None, None
         try:
             # 2. 计算稠密和稀疏向量
@@ -220,23 +221,21 @@ class ItemNameRecognitionNode(BaseNode):
         try:
             # 5. 创建Milvus集合(幂等性校验)
             if not milvus_client.has_collection(item_name_collection_name):
-                self._create_item_name_collection(item_name_collection_name,milvus_client)
-            
-            # 6. 构建索引
+                self._create_item_name_collection(item_name_collection_name, milvus_client)
+
+            # 6. 构建数据行
             item_name_data_row = {
                 "file_title": file_title,
                 "item_name": item_name,
                 "dense_vector": dense_vector,
                 "sparse_vector": sparse_vector
             }
-
             # 7. 插入数据
             inserted_result = milvus_client.insert(collection_name=item_name_collection_name, data=[item_name_data_row])
-
-            self.logger.info(f"插入的结果:{inserted_result},主键值:{inserted_result.get('ids')}")
         except Exception as e:
             self.logger.error(f"商品名{item_name}插入失败 {str(e)}")
-            return
+
+        self.logger.info(f"插入的结果:{inserted_result},主键值:{inserted_result.get('ids')}")
 
     def _create_item_name_collection(self, item_name_collection_name: str, milvus_client: MilvusClient):
         """
@@ -301,13 +300,19 @@ class ItemNameRecognitionNode(BaseNode):
         # 2. 更新state中的item_name
         state['item_name'] = item_name
 
+
 if __name__ == '__main__':
     import json
 
     setup_logging()
 
     # 1. 读取chunk.json
-    chunk_json_path = r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\chunks.json"
+    temp_dir = Path(
+        r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp")
+
+    chunk_json_path = temp_dir / "chunks.json"
+    output_path = temp_dir / "chunks_item_name.json"
+
     with open(chunk_json_path, "r", encoding="utf-8") as f:
         chunk_content = json.load(f)
 
@@ -327,3 +332,8 @@ if __name__ == '__main__':
     print(f"商品名: {result.get('item_name')}")
     print(f"chunks数量: {len(result.get('chunks', []))}")
     print(f"首个chunk是否含item_name: {'item_name' in result['chunks'][0]}")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=4)
+
+    print(f"item_name:{result.get('item_name')}生成完成，结果已保存至:\n{output_path}")

@@ -8,6 +8,9 @@ from knowledge.processor.import_processor.nodes.pdf_to_md_node import PdfToMdNod
 from knowledge.processor.import_processor.nodes.entry_node import EntryNode
 from knowledge.processor.import_processor.nodes.md_to_img_node import MarkDownToImgNode
 from knowledge.processor.import_processor.nodes.document_split_node import DocumentSplitNode
+from knowledge.processor.import_processor.nodes.item_name_recognition_node import ItemNameRecognitionNode
+from knowledge.processor.import_processor.nodes.embedding_chunks_node import EmbeddingChunksNode
+from knowledge.processor.import_processor.nodes.import_milvus_node import ImportMilvusNode
 from knowledge.processor.import_processor.state import ImportGraphState
 
 """
@@ -56,7 +59,10 @@ def import_graph()->CompiledStateGraph:
         "entry_node": EntryNode(),
         "pdf_to_md_node": PdfToMdNode(),
         "md_to_img_node": MarkDownToImgNode(),
-        "document_split_node": DocumentSplitNode()
+        "document_split_node": DocumentSplitNode(),
+        "item_name_recognition_node": ItemNameRecognitionNode(),
+        "embedding_chunks_node": EmbeddingChunksNode(),
+        "import_milvus_node": ImportMilvusNode()
     }
 
     # 4. 遍历映射表添加
@@ -74,7 +80,10 @@ def import_graph()->CompiledStateGraph:
     # 5.2 定义业务边
     work_flow.add_edge("pdf_to_md_node", "md_to_img_node")
     work_flow.add_edge("md_to_img_node", "document_split_node")
-    work_flow.add_edge("document_split_node", END)
+    work_flow.add_edge("document_split_node", "item_name_recognition_node")
+    work_flow.add_edge("item_name_recognition_node", "embedding_chunks_node")
+    work_flow.add_edge("embedding_chunks_node", "import_milvus_node")
+    work_flow.add_edge("import_milvus_node", END)
 
     # 5.3 编译
     complied_state_graph = work_flow.compile()
@@ -93,7 +102,7 @@ def run_import_graph():
     # 1. 定义运行graph流程的状态
 
     graph_state = {
-        "import_file_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\HUAWEI MateStation B515 用户手册-(PanguL,Windows11_02,zh-cn).pdf",
+        "import_file_path": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp\万用表的使用.pdf",
         "file_dir": r"C:\Users\a3384310973\Desktop\BJ251208\shopkeeper_brain\knowledge\processor\import_processor\nodes\temp"
 
     }
