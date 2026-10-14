@@ -93,7 +93,8 @@ class AIClients(BaseClientManager):
             # 1. 获取环境变量
             model_name = cls._require_env('BGE_M3_PATH')
             device = cls._require_env('BGE_DEVICE')
-            fp16 = cls._require_env('BGE_FP16')
+            fp16_str = cls._require_env('BGE_FP16')
+            fp16 = fp16_str.lower() in ("true", "1")
 
             # 2. 创建
             bge_m3_ef = BGEM3EmbeddingFunction(

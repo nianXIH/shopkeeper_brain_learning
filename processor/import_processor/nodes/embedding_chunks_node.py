@@ -1,7 +1,6 @@
 from typing import List, Dict, Any
 from pathlib import Path
 
-from openai.types import embedding_model
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from knowledge.processor.import_processor.base import BaseNode, setup_logging, T
 from knowledge.processor.import_processor.state import ImportGraphState

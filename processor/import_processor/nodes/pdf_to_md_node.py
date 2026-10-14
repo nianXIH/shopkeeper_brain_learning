@@ -6,9 +6,6 @@ import zipfile
 from pathlib import Path
 from typing import Tuple
 
-from setuptools import setup
-from sympy import timed
-
 from knowledge.processor.import_processor.base import BaseNode, T, setup_logging
 from knowledge.processor.import_processor.exceptions import StateFieldError, PdfConversionError
 from knowledge.processor.import_processor.state import ImportGraphState

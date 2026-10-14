@@ -504,6 +504,11 @@ class _ImageUploader:
         try:
             minio_client = StorageClients.get_minio_client()
         except Exception as e:
+            # 之前这里静默吞异常，导致 MinIO 不可用时(如 RequestTimeTooSkewed / 连接超时)
+            # 日志里看不到任何错误，排查困难。此处必须显式记录。
+            self.logger.error(
+                f"获取MinIO客户端失败, {len(img_info_list)}张图片全部回退到本地路径. 原因: {e}"
+            )
             for img_info in img_info_list:
                 remote_urls[img_info.name] = img_info.path
             return remote_urls

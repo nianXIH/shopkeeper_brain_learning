@@ -1,7 +1,5 @@
 from pathlib import Path
 
-from onnxruntime.tools.file_utils import files_from_file_or_dir
-
 from knowledge.processor.import_processor.base import BaseNode, setup_logging,T
 from knowledge.processor.import_processor.state import ImportGraphState
 from knowledge.processor.import_processor.exceptions import StateFieldError,ValidationError
