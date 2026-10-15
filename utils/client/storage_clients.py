@@ -5,33 +5,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-import urllib3
-from urllib3.util import Timeout
 from minio import Minio
 from pymilvus import MilvusClient
+from pymongo import MongoClient
+from pymongo.database import Database
 from dotenv import load_dotenv
 from knowledge.utils.client.base import BaseClientManager
 
 load_dotenv()
-
-# MinIO HTTP 客户端的超时与重试策略
-# connect: 建立 TCP 连接的超时(秒)，避免 endpoint 不通时无限挂起
-# read:    单次请求响应读取的超时(秒)，覆盖大文件上传场景
-_MINIO_CONNECT_TIMEOUT = 5
-_MINIO_READ_TIMEOUT = 60
-
-
-def _build_minio_http_client() -> urllib3.PoolManager:
-    """构建带超时/重试的 urllib3 客户端，注入给 Minio SDK。"""
-    return urllib3.PoolManager(
-        timeout=Timeout(connect=_MINIO_CONNECT_TIMEOUT, read=_MINIO_READ_TIMEOUT),
-        retries=urllib3.Retry(
-            total=2,
-            backoff_factor=0.5,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=frozenset(["GET", "PUT", "HEAD", "DELETE"]),
-        ),
-    )
 
 
 class StorageClients(BaseClientManager):
@@ -42,6 +23,9 @@ class StorageClients(BaseClientManager):
 
     _milvus_client: Optional[MilvusClient] = None
     _milvus_lock = threading.Lock()
+
+    _mongo_db: Optional[Database] = None
+    _mongo_lock = threading.Lock()
 
     # ── MinIO ──
 
@@ -57,28 +41,13 @@ class StorageClients(BaseClientManager):
             secret_key = cls._require_env("MINIO_SECRET_KEY")
             bucket_name = cls._require_env("MINIO_BUCKET_NAME")
 
-            client = Minio(
-                endpoint,
-                access_key=access_key,
-                secret_key=secret_key,
-                secure=False,
-                http_client=_build_minio_http_client(),
-            )
+            client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=False)
 
-            # 显式捕获 S3 层错误，把服务端返回的 code(如 RequestTimeTooSkewed / SignatureDoesNotMatch)
-            # 打到日志里，避免上层拿到 ConnectionError 却看不到真正原因
-            try:
-                exists = client.bucket_exists(bucket_name)
-                if not exists:
-                    client.make_bucket(bucket_name)
-                    logger.info(f"MinIO bucket '{bucket_name}' 已自动创建")
-                else:
-                    logger.info(f"MinIO bucket '{bucket_name}' 已存在")
-            except Exception as bucket_err:
-                logger.error(
-                    f"MinIO bucket '{bucket_name}' 检查/创建失败 endpoint={endpoint}: {bucket_err}"
-                )
-                raise
+            if not client.bucket_exists(bucket_name):
+                client.make_bucket(bucket_name)
+                logger.info(f"MinIO bucket '{bucket_name}' 已自动创建")
+            else:
+                logger.info(f"MinIO bucket '{bucket_name}' 已存在")
 
             logger.info(f"MinIO 客户端初始化成功 (endpoint={endpoint})")
             return client
@@ -109,6 +78,34 @@ class StorageClients(BaseClientManager):
         except Exception as e:
             logger.error(f"Milvus 客户端创建失败: {e}")
             raise ConnectionError(f"Milvus 连接失败: {e}") from e
+
+    # ── MongoDB ──
+
+    @classmethod
+    def get_mongo_db(cls) -> Database:
+        return cls._get_or_create("_mongo_db", cls._mongo_lock, cls._create_mongo_db)
+
+    @classmethod
+    def _create_mongo_db(cls) -> Database:
+        try:
+            mongo_url = cls._require_env("MONGO_URL")
+            db_name = cls._require_env("MONGO_DB_NAME")
+
+            # 1. 实例化客户端
+            client = MongoClient(mongo_url)
+
+            # 2. 根据客户端获取数据库对象
+            db = client[db_name]
+
+            logger.info(f"MongoDB 客户端初始化成功 (db={db_name})")
+
+            # 3. 返回数据库对象
+            return db
+        except EnvironmentError:
+            raise
+        except Exception as e:
+            logger.error(f"MongoDB 客户端创建失败: {e}")
+            raise ConnectionError(f"MongoDB 连接失败: {e}") from e
 
 
 if __name__ == '__main__':
