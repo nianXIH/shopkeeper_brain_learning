@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>小晞智库 · 导航</title>
+  <style>
+    :root{
+      --bg:#0f172a;
+      --panel:rgba(30, 41, 59, 0.7);
+      --text:#e2e8f0;
+      --muted:#94a3b8;
+      --brand:#38bdf8;
+      --brand2:#818cf8;
+      --border:rgba(255, 255, 255, 0.1);
+      --shadow:0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, Arial, sans-serif;
+      background-color: #0f172a;
+      background-image: radial-gradient(circle at 15% 50%, rgba(56, 189, 248, 0.08) 0%, transparent 50%),
+                        radial-gradient(circle at 85% 30%, rgba(129, 140, 248, 0.08) 0%, transparent 50%),
+                        linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                        linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 40px 40px, 40px 40px;
+      color:var(--text);
+      min-height:100vh;
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      padding:18px;
+    }
+    .app{
+      width:100%;
+      max-width:860px;
+      background:var(--panel);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border:1px solid var(--border);
+      border-radius:16px;
+      box-shadow:var(--shadow);
+      padding:34px 30px 26px;
+    }
+    .brand{
+      display:flex;
+      align-items:center;
+      gap:14px;
+      margin-bottom:8px;
+    }
+    .logo{
+      width:46px;height:46px;border-radius:12px;
+      background:linear-gradient(135deg, var(--brand), var(--brand2));
+      box-shadow:0 0 24px rgba(56, 189, 248, 0.4);
+      flex:0 0 auto;
+    }
+    .brand h1{
+      margin:0;
+      font-size:22px;
+      font-weight:600;
+      letter-spacing:1px;
+      color:#f8fafc;
+      text-shadow:0 0 20px rgba(56, 189, 248, 0.4);
+    }
+    .brand p{
+      margin:4px 0 0;
+      font-size:13px;
+      color:var(--muted);
+    }
+    .cards{
+      margin-top:28px;
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
+      gap:18px;
+    }
+    .card{
+      display:block;
+      text-decoration:none;
+      color:inherit;
+      background:rgba(15, 23, 42, 0.5);
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:24px 22px;
+      transition:transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+      position:relative;
+      overflow:hidden;
+    }
+    .card:hover{
+      transform:translateY(-3px);
+      border-color:rgba(56, 189, 248, 0.4);
+      box-shadow:0 14px 30px -8px rgba(0, 0, 0, 0.5), inset 0 0 24px rgba(56, 189, 248, 0.06);
+    }
+    .card-icon{
+      font-size:40px;
+      line-height:1;
+      margin-bottom:14px;
+      filter:drop-shadow(0 0 10px rgba(56, 189, 248, 0.5));
+    }
+    .card-title{
+      font-size:17px;
+      font-weight:600;
+      color:#f1f5f9;
+      margin-bottom:8px;
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .card-desc{
+      font-size:13px;
+      color:var(--muted);
+      line-height:1.6;
+    }
+    .card-meta{
+      margin-top:16px;
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .pill{
+      font-size:12px;
+      color:var(--muted);
+      border:1px solid var(--border);
+      padding:4px 10px;
+      border-radius:999px;
+      background:rgba(15, 23, 42, 0.6);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .status{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      font-size:12px;
+      padding:4px 10px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background:rgba(15, 23, 42, 0.6);
+      color:var(--muted);
+    }
+    .dot{
+      width:8px;height:8px;border-radius:50%;
+      background:#64748b;
+    }
+    .status.online{color:#4ade80}
+    .status.online .dot{background:#22c55e; box-shadow:0 0 8px rgba(34, 197, 94, 0.8)}
+    .status.offline{color:#f87171}
+    .status.offline .dot{background:#ef4444; box-shadow:0 0 8px rgba(239, 68, 68, 0.8)}
+    .go{
+      margin-top:18px;
+      font-size:13px;
+      color:var(--brand);
+      display:flex;
+      align-items:center;
+      gap:6px;
+      transition:gap 0.2s ease;
+    }
+    .card:hover .go{gap:10px}
+    .footer{
+      margin-top:26px;
+      text-align:center;
+      font-size:12px;
+      color:#64748b;
+    }
+    .footer .kbd{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      border:1px solid var(--border);
+      padding:1px 6px;
+      border-radius:6px;
+      background:rgba(15, 23, 42, 0.6);
+      color:#94a3b8;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <h1>小晞智库</h1>
+        <p>知识库导入与查询一体化平台</p>
+      </div>
+    </div>
+
+    <div class="cards">
+      <a class="card" id="cardImport" href="#" target="_self">
+        <div class="card-icon">📥</div>
+        <div class="card-title">文件导入</div>
+        <div class="card-desc">
+          上传产品手册 PDF，自动完成解析、切分、向量化并入库，全程可视化进度跟踪。
+        </div>
+        <div class="card-meta">
+          <span class="pill" id="importPortPill">:8000</span>
+          <span class="status" id="importStatus"><span class="dot"></span><span class="text">检测中…</span></span>
+        </div>
+        <div class="go">进入导入页 <span>→</span></div>
+      </a>
+
+      <a class="card" id="cardQuery" href="#" target="_self">
+        <div class="card-icon">💬</div>
+        <div class="card-title">知识查询</div>
+        <div class="card-desc">
+          面向知识库的智能问答，支持商品名对齐、多路检索与流式答案输出。
+        </div>
+        <div class="card-meta">
+          <span class="pill" id="queryPortPill">:8001</span>
+          <span class="status" id="queryStatus"><span class="dot"></span><span class="text">检测中…</span></span>
+        </div>
+        <div class="go">进入查询页 <span>→</span></div>
+      </a>
+    </div>
+
+    <div class="footer">
+      提示：导入服务与查询服务需分别启动（<span class="kbd">import_router.py</span> / <span class="kbd">query_router.py</span>），
+      可通过 URL 参数 <span class="kbd">?import_port=8000&query_port=8001</span> 自定义端口
+    </div>
+  </div>
+
+  <script>
+    // 上传页与查询页分属两个服务（不同端口）：
+    // 上传(import_router.py)=8000  查询(query_router.py)=8001
+    // 主机沿用当前页面的 hostname（localhost / 127.0.0.1 / 局域网IP均可）
+    // 双击本地打开(file://)时 hostname 为空，回退 127.0.0.1
+    const params = new URLSearchParams(location.search);
+    const IMPORT_PORT = params.get('import_port') || '8000';
+    const QUERY_PORT = params.get('query_port') || '8001';
+    const host = location.hostname || '127.0.0.1';
+
+    const importUrl = `http://${host}:${IMPORT_PORT}/front/import.html`;
+    const queryUrl = `http://${host}:${QUERY_PORT}/front/chat.html`;
+
+    document.getElementById('cardImport').href = importUrl;
+    document.getElementById('cardQuery').href = queryUrl;
+    document.getElementById('importPortPill').textContent = `:${IMPORT_PORT}`;
+    document.getElementById('queryPortPill').textContent = `:${QUERY_PORT}`;
+
+    // 探测服务是否在线：各服务根路由 GET / 正常返回即视为在线
+    async function probe(port, statusId){
+      const el = document.getElementById(statusId);
+      const textEl = el.querySelector('.text');
+      try{
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        const res = await fetch(`http://${host}:${port}/`, { signal: controller.signal });
+        clearTimeout(timer);
+        if(res.ok){
+          el.className = 'status online';
+          textEl.textContent = '在线';
+          return;
+        }
+        throw new Error('bad status ' + res.status);
+      }catch(_){
+        el.className = 'status offline';
+        textEl.textContent = '离线';
+      }
+    }
+
+    probe(IMPORT_PORT, 'importStatus');
+    probe(QUERY_PORT, 'queryStatus');
+  </script>
+</body>
+</html>
