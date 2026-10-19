@@ -1,6 +1,5 @@
 from typing import List, Dict, Any, Tuple
 from langchain_openai import ChatOpenAI
-from sympy import content
 
 from knowledge.processor.query_processor.base import BaseNode, T
 from knowledge.processor.query_processor.state import QueryGraphState
@@ -28,24 +27,28 @@ class AnswerOutPutNode(BaseNode):
 
         """
         # 1. 判断是否是流式
-        is_stream = state.get("is_stream")
+        is_stream = bool(state.get("is_stream"))
 
         # 2. 获取任务id
         task_id = state.get("task_id")
 
         # 3. 判断state中是否有answer
+        # streamed：本次执行中答案是否已经通过 DELTA 事件流式推送给了前端
+        streamed = False
         if state.get("answer"):
-            # 将答案推送出去
-            self._push_exist_answer(task_id,is_stream,state)
-            is_stream = False
+            # 3.1 上游节点已经生成了答案(商品名模糊被拦截/无法识别等提示语)
+            #     该答案没有经过 DELTA 流式推送，只负责写入非流式的任务结果队列
+            self._push_exist_answer(task_id, is_stream, state)
         else:
             # 3.2 组装提示词
             prompt = self._build_prompt(state)
             state["prompt"] = prompt
 
-            # 3.3 调用LLM(流式和非流式)
-            self._generate_answer(prompt,task_id,state)
-            is_streamed = is_stream
+            # 3.3 调用LLM(流式和非流式) 流式且成功时答案已经通过 DELTA 事件推送给了前端
+            self._generate_answer(prompt, task_id, state)
+            # 失败(answer_error)时 FINAL 需携带降级答案返回，覆盖已推送的残缺delta；
+            # 成功时 FINAL 只负责通知前端通道关闭
+            streamed = is_stream and not state.get("answer_error")
 
         # 4. 保留历史会话
         # 4.1 只要你问了问题 有答案(LLM生成 你生成)
@@ -53,10 +56,10 @@ class AnswerOutPutNode(BaseNode):
 
         # 5. 关闭sse通道(修改事件类型为FINAL)
         if is_stream:
-            # 5.1 已经流过（LLM生成的答案）
-            if is_streamed:
+            # 5.1 已经流过（LLM生成的答案），FINAL 只负责通知前端通道关闭
+            if streamed:
                 push_sse_event(task_id=task_id, event=SSEEvent.FINAL, data={})
-            # 5.2 没有流过(自己生成的答案)
+            # 5.2 没有流过(上游节点直接生成的答案)，FINAL 需要携带完整答案
             else:
                 push_sse_event(task_id=task_id, event=SSEEvent.FINAL, data={"answer": state.get('answer')})
 
@@ -150,11 +153,11 @@ class AnswerOutPutNode(BaseNode):
                                          ("source", "[source={}]"),
                                          ("url", "[url={}]")]:
                 # a. 获取各个元数据字段的值
-                filed_value = str(context.get(meta_field, "")).strip()
+                field_value = str(context.get(meta_field, "")).strip()
 
                 # b.格式化模版中的占位符
-                if filed_value:
-                    metadata_content.append(template.format(filed_value))
+                if field_value:
+                    metadata_content.append(template.format(field_value))
 
             # 1.5 获取得分
             doc_score = context.get('score')
@@ -241,8 +244,8 @@ class AnswerOutPutNode(BaseNode):
         try:
             llm_client = AIClients.get_llm_client(response_format=False)
         except ConnectionError as e:
-            self.logger.error(f"获取LLM客户端失败 原因:{str(e)}")
-            state['answer'] = "LLM暂无法回答"
+            self.logger.exception(f"获取LLM客户端失败 原因:{str(e)}")
+            self._set_fallback_answer(task_id, state)
             return
 
         # 2. 判断流式开关
@@ -256,6 +259,21 @@ class AnswerOutPutNode(BaseNode):
             # 2.2 非流式调用
             state['answer'] = self._invoke_llm(prompt, llm_client)
             # 写入到任务结果队列中(非流式调用)
+            set_task_result(task_id=task_id, key="answer", value=state['answer'])
+
+        # 3. LLM调用失败(返回空串)时写入统一降级文案，不把空答案当真实结果返回
+        if not state['answer']:
+            self._set_fallback_answer(task_id, state)
+
+    def _set_fallback_answer(self, task_id: str, state: QueryGraphState):
+        """
+        LLM生成失败时的统一降级处理：写入占位答案并打上失败标记
+        - answer_error 标记用于：1)不把降级文案当真实答案入历史 2)流式时FINAL携带完整答案覆盖残缺delta
+        """
+        state['answer'] = "LLM暂时无法生成回答，请稍后重试。"
+        state['answer_error'] = True
+        # 非流式调用：降级文案也要能通过任务结果队列返回给调用方
+        if not state.get('is_stream'):
             set_task_result(task_id=task_id, key="answer", value=state['answer'])
 
 
@@ -273,17 +291,12 @@ class AnswerOutPutNode(BaseNode):
             # 1. 同步调用
             llm_res = llm_client.invoke(prompt)
 
-            # 2. 获取内容
-            llm_content = getattr(llm_res, 'content', "") or ""
+            # 2. 获取内容（空内容同样视为失败，交由上层统一降级）
+            return getattr(llm_res, 'content', "") or ""
 
-            # 3. 判断
-            if not llm_content:
-                return "LLM暂无法回答"
-
-            return llm_content
         except Exception as e:
-            self.logger.error(f"LLM调用失败 原因:{str(e)}")
-            return "LLM暂无法回答"
+            self.logger.exception(f"LLM调用失败 原因:{str(e)}")
+            return ""
 
 
     def _stream_llm(self, task_id: str, prompt: str, llm_client: ChatOpenAI) -> str:
@@ -310,8 +323,10 @@ class AnswerOutPutNode(BaseNode):
                                    )
                     accelerate_delta += delta_text
         except Exception as e:
-            self.logger.error(f"LLM流式调用失败 原因:{str(e)}")
-            return "LLM暂无法回答"
+            self.logger.exception(f"LLM流式调用失败 原因:{str(e)}")
+            # 中途失败时已推送的delta是残缺内容：丢弃并返回空串，交由上层统一降级，
+            # 保证 FINAL 携带的最终答案与前端已见内容不冲突
+            return ""
 
         return accelerate_delta
 
@@ -326,6 +341,11 @@ class AnswerOutPutNode(BaseNode):
         Returns:
 
         """
+        # 0. LLM生成失败的降级文案不是真实答案：不入库，否则会污染后续多轮对话的历史上下文
+        if state.get('answer_error'):
+            self.logger.warning("答案生成失败，本次对话不保存到历史")
+            return
+
         # 1. 获取session_id
         session_id = state.get('session_id')
 
@@ -356,4 +376,4 @@ class AnswerOutPutNode(BaseNode):
                               item_names=item_names
                               )
         except Exception as e:
-            self.logger.error(f"保存历史对话到MongDB中失败 原因:{str(e)}")
+            self.logger.exception(f"保存历史对话到MongDB中失败 原因:{str(e)}")

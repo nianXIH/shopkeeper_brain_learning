@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import Optional
 from typing import TypeVar, Optional
@@ -41,7 +42,10 @@ class StorageClients(BaseClientManager):
             secret_key = cls._require_env("MINIO_SECRET_KEY")
             bucket_name = cls._require_env("MINIO_BUCKET_NAME")
 
-            client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=False)
+            # secure 走环境变量 MINIO_SECURE(默认false)：
+            # 硬编码secure=False会让 HTTPS 部署的 MinIO 始终走 HTTP，配置形同虚设
+            secure = os.getenv("MINIO_SECURE", "false").strip().lower() in ("1", "true", "yes")
+            client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
 
             if not client.bucket_exists(bucket_name):
                 client.make_bucket(bucket_name)

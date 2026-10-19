@@ -7,4 +7,10 @@ __pycache__/
 .venv/
 
 # MinerU 解析产物（中间 json、md、图片），由 pdf_to_md 节点在本地生成
-processor/import_processor/nodes/temp/output/
+processor/import_processor/nodes/temp/
+
+# 上传文件与解析中间产物（原始PDF、chunks.json等运行时数据）
+temp_data/
+
+# Python 缓存
+__pycache__/

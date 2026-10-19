@@ -1,8 +1,10 @@
+import logging
 import os.path
 
 import uvicorn
 from fastapi import FastAPI, UploadFile, Depends, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from knowledge.core.paths import get_front_page_dir
@@ -25,12 +27,17 @@ def create_app():
     """
 
     # 1. 实例化
-    app = FastAPI(description="掌柜智库导入的应用", version="v1.0")
+    app = FastAPI(description="小晞智库导入的应用", version="v1.0")
 
-    # 2. 跨域配置
+    # 1.1 应用入口统一配置根日志（各业务模块只getLogger，不再各自basicConfig）
+    logging.basicConfig(level=logging.INFO)
+
+    # 2. 跨域配置：来源白名单走环境变量CORS_ALLOW_ORIGINS（逗号分隔），
+    #    默认*仅适用于本地开发，生产环境应显式收紧
+    allow_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # ← 和 credentials=True 冲突
+        allow_origins=allow_origins,  # ← 和 credentials=True 冲突
         allow_credentials=False,  # 自定义cookies Authorization  tsl客户端证书信息
         allow_methods=["*"],  # ← 和 credentials=True 冲突  GET(获取资源)  POST(新增)  DELETE（删除） PUT（修改）
         allow_headers=["*"],  # ← 和 credentials=True 冲突   自定义的头字段 token  content-type:application/json
@@ -40,7 +47,17 @@ def create_app():
     page_dir = get_front_page_dir()
 
     if page_dir and os.path.exists(page_dir):
-        app.mount("/front",StaticFiles(directory=page_dir))
+        # / 与 /front/ 统一导向导航首页 index.html，由它跳转到上传页(8000)或查询页(8001)
+        # 注意：路由必须在 mount 之前注册，否则会被静态挂载拦截
+        @app.get("/", include_in_schema=False)
+        async def root_index():
+            return RedirectResponse(url="/front/")
+
+        @app.get("/front/", include_in_schema=False)
+        async def front_index():
+            return RedirectResponse(url="/front/index.html")
+
+        app.mount("/front", StaticFiles(directory=page_dir), name="front")
 
 
     # 4. 注册路由
@@ -50,8 +67,9 @@ def create_app():
     return app
 
 def register_router(app:FastAPI):
-    @app.get("/")
+    @app.get("/api", include_in_schema=False)
     def hello_world():
+        # 根路径 / 已重定向到前端导航页，这里保留一个 /api 健康检查入口
         return {"message": "success"}
 
     # 1. 上传请求

@@ -137,6 +137,7 @@ class BaseNode(ABC):
                        }
                        )
 
+    @staticmethod
     def setup_logging(level: int = logging.INFO):
         """配置查询流程日志。
 

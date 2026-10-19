@@ -10,13 +10,13 @@ from knowledge.utils.client.storage_clients import StorageClients
 from knowledge.utils.embedding_util import generate_bge_m3_hybrid_vectors
 from knowledge.utils.milvus_util import create_hybrid_search_requests, execute_hybrid_search_query
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-from knowledge.processor.query_processor.base import BaseNode
-from knowledge.processor.query_processor.state import QueryGraphState
 from knowledge.utils.client.ai_clients import AIClients
 from knowledge.utils.mongo_history_util import get_recent_messages
+from knowledge.processor.query_processor.base import BaseNode
+from knowledge.processor.query_processor.state import QueryGraphState
+
+# 日志配置只应在应用入口（router的create_app）统一做，库模块导入即basicConfig属于反模式
+logger = logging.getLogger(__name__)
 
 class _ItemNameExtractor():
     def extract_item_name(self, original_query: str, history_context: str) -> Dict[str, Any]:
@@ -66,7 +66,13 @@ class _ItemNameExtractor():
             return llm_result
 
         # 7. 清洗(判断输出内容的类型以及空格)和解析(反序列化)
-        parsed_result: Dict[str, Any] = self._clean_and_parse(llm_response_content)
+        # LLM 输出不可控：即使带了 json_object 约束也可能输出非法 JSON，
+        # 解析失败必须降级(视为未提取到商品名)，不能让整个查询链路失败
+        try:
+            parsed_result: Dict[str, Any] = self._clean_and_parse(llm_response_content)
+        except JSONDecodeError as e:
+            logger.error(f"LLM输出结果反序列化失败，降级为原始查询 原因:{str(e)}")
+            return llm_result
 
         # 8. 组装数据
         llm_result['item_names'] = parsed_result.get('item_names')
@@ -304,7 +310,10 @@ class _ItemNameAligner():
                        and m.get('item_name') not in confirmed]
                 if mid:
                     for m in mid[:self._config.item_name_max_options]:
-                        options.append(m.get('item_name'))  # 一次循环内部只留三个可选的
+                        picked = m.get('item_name')
+                        # m.get可能返回None：不过滤会把None塞进options展示给前端
+                        if picked and picked not in options and picked not in confirmed:
+                            options.append(picked)  # 一次循环内部只留三个可选的
 
         return confirmed, options[:self._config.item_name_max_options]  # 最终只留三个可选的商品名给前端
 
@@ -325,8 +334,9 @@ class _ItemNameAligner():
 
         # 1. 构建 商品名 → 最高分数 的映射
         item_name_score = {}
-        for search_result in search_result:
-            matches = search_result.get('matches', [])
+        # 遍历变量重命名：不能与参数 search_result 同名（遮蔽后后续代码拿不到原始列表）
+        for item_sea_res in search_result:
+            matches = item_sea_res.get('matches', [])
             for m in matches:
                 score = m.get('score', 0)
                 item_name = m.get('item_name')
@@ -396,6 +406,11 @@ class ItemNameConfirmedNode(BaseNode):
         # 3.1 获取LLM结果
         item_names = llm_result.get('item_names')
         rewritten_query = llm_result.get('rewritten_query')
+
+        # 3.2 将LLM重写后的查询写入state：下游三路检索节点(hybrid/hyde/web_mcp)都依赖该字段
+        #     做参数校验，漏写会导致三路检索全部抛 StateFieldError 查询链路中断
+        #     (extractor已保证：LLM提取失败/改写为空时回退为原始查询，不会是空串)
+        state['rewritten_query'] = rewritten_query
 
         # 4. 根据item_names做判断
         if item_names:

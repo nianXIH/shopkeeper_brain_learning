@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import shutil
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -12,6 +13,8 @@ from knowledge.processor.import_processor.state import ImportGraphState
 
 
 class PdfToMdNode(BaseNode):
+    # MinerU 解析超时（秒）：超时后强杀子进程，避免挂死导致任务永远停在processing
+    _MINERU_TIMEOUT_SECONDS = 600
     def process(self, state: ImportGraphState) -> ImportGraphState:
         """
         节点的处理逻辑入口
@@ -105,9 +108,7 @@ class PdfToMdNode(BaseNode):
         file_stem = import_file_path_obj.stem
         zip_output_dir = file_dir_obj / "output"
         zip_output_dir.mkdir(parents=True, exist_ok=True)
-        print("import_file_path_obj:", import_file_path_obj)
-        print("file_dir_obj:", file_dir_obj)
-        print("zip_output_dir:", zip_output_dir)
+        self.logger.info(f"MinerU解析输入:{import_file_path_obj} 输出目录:{zip_output_dir}")
 
         cmd = [
             self._resolve_mineru_exe(),
@@ -132,13 +133,27 @@ class PdfToMdNode(BaseNode):
                                 bufsize=1  # 实时输出。按行输出遇到\n换行符 就将日志产生出来
                                 )
 
-        # 3. 实时打印日志
-        if proc.stdout:
-            for line in proc.stdout:
-                self.logger.info(f"MinerU解析产生的日志：{line}")
+        # 3. 后台线程实时读取子进程日志：
+        #    若MinerU挂死不退出，主线程若直接送代 stdout 会永久阻塞在管道读取上，
+        #    读日志与带超时的 wait 必须分开在不同线程
+        def _drain_output():
+            if proc.stdout:
+                for line in proc.stdout:
+                    self.logger.info(f"MinerU解析产生的日志：{line}")
 
-        # 4. 主线程等待子进程做完（状态码0：成功 反之失败）
-        processed_result = proc.wait()
+        reader = threading.Thread(target=_drain_output, daemon=True)
+        reader.start()
+
+        # 4. 主线程带超时等待子进程结束（状态码0：成功 反之失败）；超时则强杀，避免任务永远停在processing
+        try:
+            processed_result = proc.wait(timeout=self._MINERU_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # 4.1 强杀挂死的MinerU子进程并回收资源
+            proc.kill()
+            proc.wait()
+            self.logger.error(f"MinerU解析超时(>{self._MINERU_TIMEOUT_SECONDS}秒)，已强制终止子进程")
+            return 1
+        reader.join(timeout=5)
         end_time = time.time()
         if processed_result != 0:
             self.logger.info(f"MinerU解析失败")

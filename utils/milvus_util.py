@@ -1,8 +1,8 @@
 import os
 import logging
 
+# 日志配置只应在应用入口（router的create_app）统一做，库模块导入即basicConfig属于反模式
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 from dotenv import load_dotenv
 

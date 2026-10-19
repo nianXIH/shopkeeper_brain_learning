@@ -12,7 +12,13 @@ class RerankerNode(BaseNode):
     @staticmethod
     def _sigmoid(score: float) -> float:
         """sigmoid归一化，将 (-∞, +∞) 映射到 (0, 1)"""
-        return 1.0 / (1.0 + math.exp(-score))
+        # 数值稳定实现：FlagReranker 输出的原始 logit 可能为很大的负数，
+        # 直接 math.exp(-score) 会溢出抛 OverflowError；
+        # score < 0 时改用等价公式 exp(s)/(1+exp(s))，过小时直接返回 0
+        if score >= 0:
+            return 1.0 / (1.0 + math.exp(-score))
+        exp_score = math.exp(score) if score > -700 else 0.0
+        return exp_score / (1.0 + exp_score)
 
 
     def process(self, state: QueryGraphState) -> QueryGraphState:

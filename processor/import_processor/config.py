@@ -73,7 +73,9 @@ class ImportConfig:
     minio_bucket: str = field(
         default_factory=lambda: os.getenv("MINIO_BUCKET_NAME", "")
     )
-    minio_secure: bool = False
+    minio_secure: bool = field(
+        default_factory=lambda: os.getenv("MINIO_SECURE", "false").strip().lower() in ("1", "true", "yes")
+    )
 
     # ==================== 向量配置 ====================
     embedding_dim: int = field(

@@ -19,6 +19,12 @@ class AIClients(BaseClientManager):
     _openai_llm_client: Optional[ChatOpenAI]  = None
     _openai_llm_lock = threading.Lock()
 
+    # json_object 模式的 LLM 客户端单独缓存：
+    # 两种 response_format 若共用一个缓存槽，先创建的一方会覆盖另一方的配置，
+    # 导致"是否输出 JSON"取决于节点执行顺序（非确定性行为）
+    _openai_llm_json_client: Optional[ChatOpenAI] = None
+    _openai_llm_json_lock = threading.Lock()
+
     _bge_m3_client: Optional[BGEM3EmbeddingFunction] = None
     _bge_m3_lock = threading.Lock()
 
@@ -50,6 +56,10 @@ class AIClients(BaseClientManager):
     # ── LLM ──
     @classmethod
     def get_llm_client(cls, response_format: bool = True) -> ChatOpenAI:
+        # 两种模式各自独立缓存，互不覆盖
+        if response_format:
+            return cls._get_or_create("_openai_llm_json_client", cls._openai_llm_json_lock,
+                                      lambda: cls._create_llm_client(response_format))
         return cls._get_or_create("_openai_llm_client", cls._openai_llm_lock,
                                   lambda: cls._create_llm_client(response_format))
 

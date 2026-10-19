@@ -1,3 +1,5 @@
+import time
+import threading
 from typing import Any, Dict, List
 from collections import defaultdict
 
@@ -17,6 +19,16 @@ _tasks_duration: Dict[str, Dict[str, float]] = defaultdict(dict)
 _tasks_result: Dict[str, Dict[str, str]] = defaultdict(dict)
 
 _tasks_status: Dict[str, str] = {}
+
+# 读写锁：FastAPI的BackgroundTasks在线程池中并发执行查询/导入任务，
+# 这些全局dict会被多线程同时读写，无锁时list的append/remove与遍历可能互相踩踏
+_lock = threading.Lock()
+
+# 任务最后一次活跃时间：用于淘汰长期驻留的过期任务，防止全局dict无限增长(内存泄漏)
+_tasks_last_active: Dict[str, float] = {}
+
+# 任务数据保留时长(秒)：超过该时长的任务数据会在状态更新时被惰性淘汰
+_TASK_TTL_SECONDS = 3600
 
 TASK_STATUS_PROCESSING = "processing"  # 任务处理中
 TASK_STATUS_COMPLETED = "completed"  # 任务完成
@@ -48,36 +60,65 @@ def _to_cn(node_name: str) -> str:
     return _NODE_NAME_TO_CN.get(node_name, node_name)
 
 
+def _touch_task(task_id: str) -> None:
+    """刷新任务活跃时间（必须在持锁状态下调用）"""
+    _tasks_last_active[task_id] = time.time()
+
+
+def _cleanup_expired_tasks_locked() -> None:
+    """淘汰过期的任务数据（必须在持锁状态下调用）
+
+    任务进入终态（completed/failed）后不再有访问价值，
+    超过TTL的数据从所有全局dict中清除，避免 _tasks_* 随请求数无限增长（内存泄漏）
+    """
+    now = time.time()
+    expired = [task_id for task_id, last_active in _tasks_last_active.items()
+               if now - last_active > _TASK_TTL_SECONDS]
+    for task_id in expired:
+        _tasks_running_list.pop(task_id, None)
+        _tasks_done_list.pop(task_id, None)
+        _tasks_duration.pop(task_id, None)
+        _tasks_result.pop(task_id, None)
+        _tasks_status.pop(task_id, None)
+        _tasks_last_active.pop(task_id, None)
+
+
 def add_running_task(task_id: str, node_name: str) -> None:
     # 1. 获取当前任务的运行节点列表（利用 defaultdict 自动初始化特性）
-    running = _tasks_running_list[task_id]
+    with _lock:
+        running = _tasks_running_list[task_id]
 
-    # 2. 将当前节点加入运行列表（并做去重判断，防止重复添加）
-    if node_name not in running:
-        running.append(node_name)
+        # 2. 将当前节点加入运行列表（并做去重判断，防止重复添加）
+        if node_name not in running:
+            running.append(node_name)
+        _touch_task(task_id)
 
 
 def add_done_task(task_id: str, node_name: str) -> None:
-    # 1. 如果该节点还在运行列表中，则将其移出（表示该节点已结束运行）
-    if node_name in _tasks_running_list[task_id]:
-        _tasks_running_list[task_id].remove(node_name)
+    with _lock:
+        # 1. 如果该节点还在运行列表中，则将其移出（表示该节点已结束运行）
+        if node_name in _tasks_running_list[task_id]:
+            _tasks_running_list[task_id].remove(node_name)
 
-    # 2. 获取当前任务的已完成节点列表
-    done = _tasks_done_list[task_id]
+        # 2. 获取当前任务的已完成节点列表
+        done = _tasks_done_list[task_id]
 
-    # 3. 将当前节点加入已完成列表（做去重判断，防止重复标记）
-    if node_name not in done:
-        done.append(node_name)
+        # 3. 将当前节点加入已完成列表（做去重判断，防止重复标记）
+        if node_name not in done:
+            done.append(node_name)
+        _touch_task(task_id)
 
 
 def get_running_task_list(task_id: str) -> List[str]:
     # 1. 获取指定任务运行中的节点列表，并通过列表推导式统一转换为中文展示名返回
-    return [_to_cn(n) for n in _tasks_running_list.get(task_id, [])]
+    with _lock:
+        return [_to_cn(n) for n in _tasks_running_list.get(task_id, [])]
 
 
 def get_done_task_list(task_id: str) -> List[str]:
     # 1. 获取指定任务已完成的节点列表，并通过列表推导式统一转换为中文展示名返回
-    return [_to_cn(n) for n in _tasks_done_list.get(task_id, [])]
+    with _lock:
+        return [_to_cn(n) for n in _tasks_done_list.get(task_id, [])]
 
 
 def get_task_status(task_id: str) -> str:
@@ -93,15 +134,20 @@ def get_task_status(task_id: str) -> str:
 
 
 def update_task_status(task_id: str, status_name: str) -> None:
-    # 1. 更新指定任务的总体运行状态（如 processing 等）
-    _tasks_status[task_id] = status_name
+    # 1. 更新指定任务的总体运行状态（如 processing 等），并顺带惰性淘汰过期任务
+    with _lock:
+        _tasks_status[task_id] = status_name
+        _touch_task(task_id)
+        _cleanup_expired_tasks_locked()
 
 
 def set_task_result(task_id: str, key: str, value: str) -> None:
     """
     存储任务结果字段（如 answer / error）。
     """
-    _tasks_result[task_id][key] = value
+    with _lock:
+        _tasks_result[task_id][key] = value
+        _touch_task(task_id)
 
 
 def get_task_result(task_id: str, key: str, default: str = "") -> str:
@@ -114,8 +160,10 @@ def get_task_result(task_id: str, key: str, default: str = "") -> str:
 
 def add_node_duration(task_id: str, node_name: str, duration: float) -> None:
     """记录节点耗时（秒）"""
-    cn_name = _to_cn(node_name)
-    _tasks_duration[task_id][cn_name] = round(duration, 2)
+    with _lock:
+        cn_name = _to_cn(node_name)
+        _tasks_duration[task_id][cn_name] = round(duration, 2)
+        _touch_task(task_id)
 
 def get_node_durations(task_id: str) -> Dict[str, float]:
     """获取所有节点的耗时"""

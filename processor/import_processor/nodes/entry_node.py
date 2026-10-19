@@ -36,8 +36,8 @@ class EntryNode(BaseNode):
         if not file_dir_obj.exists():
             raise StateFieldError(node_name=self.name, field_name='file_dir_obj', expected_type=Path)
 
-        # 5. 获取文件的后缀
-        file_suffix = import_file_path_obj.suffix
+        # 5. 获取文件的后缀(统一转小写：Windows 上传 .PDF/.Md 等大写后缀也应被识别)
+        file_suffix = import_file_path_obj.suffix.lower()
         if file_suffix == '.pdf':
             state['is_pdf_read_enabled'] = True
             state['is_md_read_enabled'] = False

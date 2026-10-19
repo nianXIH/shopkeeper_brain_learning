@@ -1,5 +1,6 @@
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
 from typing import Tuple, List, Dict, Any,Union
 from agents.mcp import MCPServerStreamableHttp
@@ -19,14 +20,30 @@ class WebMcpSearchNode(BaseNode):
 
         # 2. 定义并且执行mcp的调用
         # 调用方调用一个async修饰的方法，有且只有两种方式：方式一：继续添加await  方式二：将这个方法放到异步环境中(调用方是同步)
-        web_search_results = asyncio.run(self._execute_mcp_server(rewritten_query))
+        web_search_results = self._run_async(self._execute_mcp_server(rewritten_query))
 
-        # 3. 判断
+        # 3. 判断：失败/无结果时返回空更新（与 hybrid/hyde 两路检索节点的返回风格统一：
+        #    都只返回本节点修改的字段，空dict表示"本路检索无产出"，不触碰state其它字段）
         if not web_search_results:
-            return state
+            return {}
 
         # 4. 返回
         return {"web_search_docs": web_search_results}
+
+    def _run_async(self, coro):
+        """
+        在同步节点中执行协程
+        - 当前线程无运行中的事件循环（线程池同步上下文）：直接 asyncio.run
+        - 已处于事件循环内（未来查询图迁移到异步上下文时）：另起线程运行，
+          避免 asyncio.run 在已有运行循环时报 RuntimeError: asyncio.run() cannot be called from a running event loop
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(asyncio.run, coro).result()
 
     def _validate_state(self, state: QueryGraphState) -> Tuple[str, List[str]]:
         # 1. 用户的问题（LLM重写后的）
@@ -57,52 +74,59 @@ class WebMcpSearchNode(BaseNode):
 
 
         # 1. 定义MCP客户端(StreamableHttp方式)
-        async with MCPServerStreamableHttp(
-                name="联网搜索",  # MCP客户端名字
-                params={  # 提供MCP服务的第三方平台的api_key和base_url
-                    "url": self.config.mcp_dashscope_base_url,
-                    "headers": {"Authorization": f"Bearer {self.config.openai_api_key}"},
-                    "timeout": 60,  # 超时时间
-                },
-                cache_tools_list=True,  # 缓存MCP服务下的工具列表的,加速
-                max_retry_attempts=3,  # 重试次数
-        ) as mcp_client:
-            # 2. 调用工具
-            web_search_result = await mcp_client.call_tool(tool_name="bailian_web_search",
-                                                           arguments={"query": rewritten_query, "count": 3})
+        # 建立连接、调用工具的任何环节都可能抛出网络/超时/认证异常；
+        # 联网搜索只是三路检索之一，失败必须降级返回空，不能让整条查询链路失败
+        try:
+            async with MCPServerStreamableHttp(
+                    name="联网搜索",  # MCP客户端名字
+                    params={  # 提供MCP服务的第三方平台的api_key和base_url
+                        "url": self.config.mcp_dashscope_base_url,
+                        "headers": {"Authorization": f"Bearer {self.config.openai_api_key}"},
+                        "timeout": 60,  # 超时时间
+                    },
+                    cache_tools_list=True,  # 缓存MCP服务下的工具列表的,加速
+                    max_retry_attempts=3,  # 重试次数
+            ) as mcp_client:
+                # 2. 调用工具
+                web_search_result = await mcp_client.call_tool(tool_name="bailian_web_search",
+                                                               arguments={"query": rewritten_query, "count": 3})
+        except Exception as e:
+            # MCP调用是三路检索里的增强项：任何环节失败都降级返回空，保住另外两路本地检索
+            self.logger.exception(f"MCP联网搜索服务调用失败 原因:{str(e)}")
+            return []
 
-            # 3. 解析数据
-            # 3.1 获取文本内容块对象
-            text_content = web_search_result.content[0]
-            if not text_content:
+        # 3. 解析数据
+        # 3.1 获取文本内容块对象(先判空再取下标，避免 content 为空列表时 IndexError)
+        text_contents = web_search_result.content
+        if not text_contents:
+            return []
+
+        # 3.2 获取文本内容块对象的内容
+        text_content_text = getattr(text_contents[0], 'text', '')
+        if not text_content_text:
+            return []
+
+        # 3.3 反序列化
+        try:
+            text_content_obj: Dict[str, Any] = json.loads(text_content_text)
+
+            # 3.4 获取真正的网页内容
+            pages = text_content_obj.get('pages', [])
+            if not pages:
                 return []
 
-            # 3.2 获取文本内容块对象的内容
-            text_content_text = text_content.text
-            if not text_content_text:
-                return []
-
-            # 3.3 反序列化
-            try:
-                text_content_obj: Dict[str, Any] = json.loads(text_content_text)
-
-                # 3.4 获取真正的网页内容
-                pages = text_content_obj.get('pages', [])
-                if not pages:
-                    return []
-
-                # 3.5 遍历
-                web_search_results = []
-                for page in pages:
-                    web_search_results.append({
-                        "snippet": page.get('snippet', '').strip(),
-                        "title": page.get('title', '').strip(),
-                        "url": page.get('url', '').strip(),
-                    })
-                return web_search_results
-            except JSONDecodeError as e:
-                self.logger.error(f"web_search检索失败 失败信息：{e.msg} 失败的内容:{e.doc} 失败的位置：{e.pos}")
-                return []
+            # 3.5 遍历
+            web_search_results = []
+            for page in pages:
+                web_search_results.append({
+                    "snippet": page.get('snippet', '').strip(),
+                    "title": page.get('title', '').strip(),
+                    "url": page.get('url', '').strip(),
+                })
+            return web_search_results
+        except JSONDecodeError as e:
+            self.logger.error(f"web_search检索失败 失败信息：{e.msg} 失败的内容:{e.doc} 失败的位置：{e.pos}")
+            return []
 
 
 if __name__ == '__main__':

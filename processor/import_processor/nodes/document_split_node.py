@@ -3,7 +3,12 @@ from typing import Tuple, List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from knowledge.processor.import_processor.base import BaseNode, setup_logging
 from knowledge.processor.import_processor.state import ImportGraphState
+from knowledge.processor.import_processor.exceptions import StateFieldError
 from knowledge.utils.markdown_util import MarkdownTableLinearizer
+
+# 标题行正则（# {1,6}）：模块级预编译一次，避免每次切分文档都重新编译
+# ()捕获组: group(1):#(1)#(6) group(2)标题的内容
+_HEADING_LINE_RE = re.compile(r"^\s*(#{1,6})\s+(.+)")
 
 
 class DocumentSplitNode(BaseNode):
@@ -50,12 +55,18 @@ class DocumentSplitNode(BaseNode):
         # 1. 获取md_content
         md_content = state.get("md_content")
 
+        # 1.1 内容缺失时直接抛错：None 会在后续 split(None) 崩溃，空文档也没有切分意义
+        if not md_content or not isinstance(md_content, str):
+            raise StateFieldError(node_name=self.name, field_name='md_content', expected_type=str)
+
         # 2. 统一换行符
-        if md_content:
-            md_content = md_content.replace("\r\n","\n").replace("\r","\n")
+        md_content = md_content.replace("\r\n", "\n").replace("\r", "\n")
 
         # 3. 获取文件的标题
+        # 3.1 标题缺失时直接抛错：None 会作为 title 进入 section，后续 len(None) 崩溃
         file_title = state.get('file_title')
+        if not file_title or not isinstance(file_title, str):
+            raise StateFieldError(node_name=self.name, field_name='file_title', expected_type=str)
 
         # 4. 校验最大值和最小值
         if config.max_content_length <= 0 or config.min_content_length <=0 or config.max_content_length < config.min_content_length:
@@ -121,9 +132,7 @@ class DocumentSplitNode(BaseNode):
         # 1.根据\n切分md_content
         md_lines = md_content.split("\n")
 
-
-        # 2. 定义正则（正则的规则是从MD中找标题#{1,6}）():捕获组:产生三个group(0) group(1):#(1)#(6) group(2)标题的内容
-        heading_re = re.compile(r"^\s*(#{1,6})\s+(.+)")
+        # 2. 使用模块级预编译的标题正则（从MD中找标题#{1,6}）
 
         # 3. 遍历切分后md_lines
         for md_line in md_lines:
@@ -133,7 +142,7 @@ class DocumentSplitNode(BaseNode):
                 in_fence = not in_fence
 
             # 3.2 判断是否要走正则
-            match = heading_re.match(md_line) if not in_fence else None
+            match = _HEADING_LINE_RE.match(md_line) if not in_fence else None
 
 
             # 3.3 判断math 是否有
@@ -177,8 +186,8 @@ class DocumentSplitNode(BaseNode):
         for section in sections:
             current_section.extend(self._split_long_section(section, max_content_length))
 
-        # 2. 合并
-        final_sections = self._merger_short_section(current_section, min_content_length)
+        # 2. 合并（同时携带max_content_length：合并结果不得超过上限，否则切分努力白费）
+        final_sections = self._merger_short_section(current_section, min_content_length, max_content_length)
 
         return final_sections
 
@@ -232,17 +241,17 @@ class DocumentSplitNode(BaseNode):
             keep_separator=True)
 
         # 6.2 切分器对象切分
-        sections = text_spliter.split_text(body)
+        split_bodies = text_spliter.split_text(body)
 
         # 6.3 判断
-        if len(sections) == 1:
+        if len(split_bodies) == 1:
             return [section]
 
-        # 6.4 遍历
+        # 6.4 遍历（遍历变量重命名：不能与参数 section 同名遮蔽）
         sub_sections = []
-        for index, section in enumerate(sections):
+        for index, split_body in enumerate(split_bodies):
             sub_sections.append({
-                "body": section,
+                "body": split_body,
                 "title": f"{title}_{index + 1}",
                 "parent_title": parent_title,
                 "file_title": file_title
@@ -251,7 +260,7 @@ class DocumentSplitNode(BaseNode):
         # 7. 返回
         return sub_sections
 
-    def _merger_short_section(self, current_sections, min_content_length) -> List[Dict[str, Any]]:
+    def _merger_short_section(self, current_sections, min_content_length, max_content_length) -> List[Dict[str, Any]]:
         """
         合并短的章节：
         短章节来源：
@@ -260,9 +269,12 @@ class DocumentSplitNode(BaseNode):
         合并策略：
         条件1：section很短比最小阈值还小
         条件2：同源（父标题相同）
+        条件3：合并后不得超过max_content_length（短section连续合并不复查上限，
+                可能拼出一个远超上限的巨型chunk，让前面的切分努力白费）
         Args:
             current_sections: 二次切分后的所有section对象
             min_content_length:每一个section的内容最小长度
+            max_content_length:每一个section的内容最大长度
 
         Returns:
             合并之后的section对象
@@ -271,17 +283,23 @@ class DocumentSplitNode(BaseNode):
 
         """
 
+        # 0. 防御：切分结果为空（空文档等极端情况）直接返回，避免 current_sections[0] 越界
+        if not current_sections:
+            return []
+
         current_section = current_sections[0]
         final_sections = []
 
         # 2. 遍历合并
         for next_section in current_sections[1:]:
             same_parent = (current_section['parent_title'] == next_section['parent_title'])
-            if same_parent and len(current_section.get('body')) < min_content_length:
+            current_body = current_section.get('body') or ""
+            next_body = next_section.get('body') or ""
+            # 合并后的预估长度：两段body + 连接符\n\n
+            merged_would_exceed = (len(current_body) + len(next_body) + 2) > max_content_length
+            if same_parent and len(current_body) < min_content_length and not merged_would_exceed:
                 # 合并 body
-                current_section['body'] = (
-                        current_section.get('body').rstrip() + "\n\n" + next_section.get('body').lstrip()
-                )
+                current_section['body'] = current_body.rstrip() + "\n\n" + next_body.lstrip()
                 # 标题回退为父标题
                 current_section['title'] = current_section['parent_title']
             else:

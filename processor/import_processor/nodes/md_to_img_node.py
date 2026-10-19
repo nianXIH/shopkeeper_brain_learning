@@ -1,5 +1,6 @@
-import re, time, base64
+import re, time, base64, threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from logging import Logger
 from typing import List,Dict,Tuple,Set,Optional,Deque
@@ -14,8 +15,15 @@ from knowledge.utils.client.ai_clients import AIClients
 from knowledge.utils.client.storage_clients import StorageClients
 
 # 模块级预编译一次
-_HEADING_RE = re.compile(r"^#{1,6}\s+")
+_HEADING_RE = re.compile(r"^#{1,6}\s+")  # 标题行
 _IMAGE_LINE_RE = re.compile(r"^!\[.*?\]\(.*?\)$")  # 整行仅由一张图片构成(独立图片段落)
+_IMAGE_REF_RE = re.compile(r"!\[(.*?)\]\((.*?)\)")  # 通用图片引用(捕获组2:引用路径，含可选title)
+
+# 图片后缀 → mime 映射：VLM请求里的 data url 必须按真实类型声明，硬编码jpeg会被严格服务端拒收
+_MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+}
 
 @dataclass
 class ImageContext:
@@ -37,7 +45,7 @@ class ImageInfo:
     """
     name:str # 图片的名字(包含后缀)
     path:str # 图片的地址
-    imag_context:ImageContext # 图片的上下文信息
+    img_context:ImageContext # 图片的上下文信息
 
 
 
@@ -172,7 +180,7 @@ class _ImageScanner:
                 continue
 
             # 1.4 封装ImageInfo对象并且放到容器中
-            img_info_list.append(ImageInfo(name=img_path.name, path=str(img_path), imag_context=ctx))
+            img_info_list.append(ImageInfo(name=img_path.name, path=str(img_path), img_context=ctx))
 
         self.logger.info(
             f"图片目录共扫描{scanned_cnt}个文件，MD中有效图片引用{len(img_info_list)}张，跳过{skipped_cnt}个")
@@ -193,18 +201,19 @@ class _ImageScanner:
           没找到--->None
         """
 
-        # 1. 预编译正则规则(主要目的：从MD（很多行）中抓取到当前这个图片)
+        # 1. 使用模块级预编译的通用图片引用模式(_IMAGE_REF_RE)逐行比对：
+        #    原来每张图片都re.compile一次专属正则，图片多时是纯浪费；
+        #    判断依据与原实现一致：引用括号内的路径部分包含当前图片名
         # ![](images\xxx.png "abc")
         # 正则在大模型应用中特别多
         # . 任意字符 * 0次或者多次  \[ \] \( \) ?非贪婪模式  escape（a.png）
-        pattern = re.compile(r"!\[.*?\]\(.*?" + re.escape(img_name) + r".*?\)")
 
         # 2. 按行切割md_content
         md_lines = md_content.split("\n")
         for md_idx,md_line in enumerate(md_lines):
 
-            # 3.1 当前行不是当前图片
-            if not pattern.search(md_line):
+            # 3.1 当行不存在「引用路径包含当前图片名」的图片引用
+            if not any(img_name in ref.group(1) for ref in _IMAGE_REF_RE.finditer(md_line)):
                 continue
 
             # 3.2 当前行包含当前图片
@@ -328,6 +337,9 @@ class _VLMSummarizer:
     _PLACEHOLDER_NO_IMAGE = "暂无图片描述"  # 读图失败或VLM调用失败
     _PLACEHOLDER_SUMMARIES = (_PLACEHOLDER_NO_SUMMARY, _PLACEHOLDER_NO_IMAGE)
 
+    # VLM并发数：受requests_per_minute限流保护，取小值避免打爆VLM服务
+    _VLM_CONCURRENCY = 4
+
     def __init__(self, logger: Logger, requests_per_minute: int):
         self.logger = logger
         self.requests_per_minute = requests_per_minute
@@ -342,9 +354,9 @@ class _VLMSummarizer:
         failed = sum(1 for v in summaries.values() if v in self._PLACEHOLDER_SUMMARIES)
         self.logger.info(f"生成了{total - failed}张图片的摘要（共{total}张，其中{failed}张为占位）")
 
-    def _summary_all(self, document_name:str, img_info_list:List[ImageInfo], vl_model:str)->Dict[str,str]:
+    def summarize_all(self, document_name:str, img_info_list:List[ImageInfo], vl_model:str)->Dict[str,str]:
         """
-        职责：为所有图片生成摘要
+        职责：为所有图片生成摘要（线程池并发调用VLM，公开方法供节点编排调用）
         Args:
             document_name: 文档的名字
             img_info_list: 所有图片信息
@@ -355,7 +367,9 @@ class _VLMSummarizer:
 
         """
         summaries = {}
-        request_timestamps: Deque[float] = deque()
+        if not img_info_list:
+            return summaries
+
         # 1. 获取VLM客户端
         try:
             vlm_client = AIClients.get_vlm_client()
@@ -366,11 +380,22 @@ class _VLMSummarizer:
             self._log_summary_count(summaries)
             return summaries
 
-        # 2.调用VLM 为每一张图片生成摘要
-        for img_info in img_info_list:
-            # 测试一下
-            self._enforce_rate_limit(request_timestamps,self.requests_per_minute)
-            summaries[img_info.name] = self._summary_one(document_name,img_info,vlm_client,vl_model)
+        # 2. 并发调用VLM为每一张图片生成摘要：
+        #    串行时N张图片耗时 N×单次调用耗时，图片多时是导入链路的主要瓶颈；
+        #    速率限制窗口deque被多线程共享，必须持锁访问（锁内sleep天然把限流等待串行化）
+        rate_lock = threading.Lock()
+        request_timestamps: Deque[float] = deque()
+
+        def _rate_limited_summary(img_info: ImageInfo) -> Tuple[str, str]:
+            with rate_lock:
+                self._enforce_rate_limit(request_timestamps, self.requests_per_minute)
+            return img_info.name, self._summary_one(document_name, img_info, vlm_client, vl_model)
+
+        max_workers = min(self._VLM_CONCURRENCY, len(img_info_list))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for img_name, summary in executor.map(_rate_limited_summary, img_info_list):
+                summaries[img_name] = summary
+
         self._log_summary_count(summaries)
 
         return summaries
@@ -388,7 +413,7 @@ class _VLMSummarizer:
 
         """
         # 1. 构造VLM需要的上下文（标题名、上文内容、下文内容）
-        parts = [p for p in (img_info.imag_context.head, img_info.imag_context.pre_text, img_info.imag_context.post_text) if p is not None]
+        parts = [p for p in (img_info.img_context.head, img_info.img_context.pre_text, img_info.img_context.post_text) if p is not None]
 
         # 2. 构建最终的上下文
         final_context = "\n\n".join(parts) if parts else "暂无上下文"
@@ -402,6 +427,8 @@ class _VLMSummarizer:
             return self._PLACEHOLDER_NO_IMAGE
 
         # 4. 利用vlm客户端调用VLM模型
+        #    按图片真实后缀声明mime：硬编码jpeg会让png/webp被错误声明，严格的服务端可能拒收
+        mime = _MIME_BY_SUFFIX.get(Path(img_info.path).suffix.lower(), "image/jpeg")
         try:
             resp = vlm_client.chat.completions.create(
                 model=vl_model,
@@ -423,7 +450,7 @@ class _VLMSummarizer:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_data}"
+                                "url": f"data:{mime};base64,{img_data}"
                             },
                         },
                     ],
@@ -523,7 +550,7 @@ class _ImageUploader:
                 remote_urls[img_info.name] = f"{minio_url}/{minio_bucket_name}/{object_name}"
                 self.logger.info(f"成功将图片{img_info.name}上传到MinIO中")
             except Exception as e:
-                self.logger.warn(f"上传图片{img_info.name}到MinIO失败,利用本地图片地址做兜底: {e}")
+                self.logger.warning(f"上传图片{img_info.name}到MinIO失败,利用本地图片地址做兜底: {e}")
                 remote_urls[img_info.name] = img_info.path
 
         self.logger.info(f"获取到远程的{len(remote_urls)}张图片地址")
@@ -541,8 +568,12 @@ class _ImageUploader:
             新md
 
         """
-        # 利用正则寻找(捕获组：()一个捕获组：group(0) 将整个匹配到的内容放进去 group(1)：图片的摘要 group(2):图片地址)
-        pattern = re.compile(r"!\[(.*?)\]\((.*?)\)")
+        # 1. 预构建 name → (summary, remote_url) 查表字典：
+        #    原来每个图片引用都遍历全部summaries比对一遍 O(引用数×图片数)，改为一次建表O(1)查
+        img_lookup: Dict[str, Tuple[str, str]] = {
+            img_name: (img_summary, remote_urls.get(img_name))
+            for img_name, img_summary in summaries.items()
+        }
 
         def replacer(match: re.Match) -> str:
             """
@@ -553,17 +584,16 @@ class _ImageUploader:
             Returns:
                 ![摘要](远程图片地址)
             """
-
-            for img_name, img_summary in summaries.items():
-                origin_img_path = match.group(2)
-                img_name_in_md = Path(origin_img_path).name
-                if img_name == img_name_in_md:
-                    # 地址缺失时保持MD中原有的图片地址，避免KeyError中断整个节点
-                    remote_url = remote_urls.get(img_name, origin_img_path)
-                    return f"![{img_summary}]({remote_url})"
+            # 用引用路径的basename直接查表
+            img_name_in_md = Path(match.group(2)).name
+            entry = img_lookup.get(img_name_in_md)
+            if entry:
+                img_summary, remote_url = entry
+                # 地址缺失时保持MD中原有的图片地址，避免KeyError中断整个节点
+                return f"![{img_summary}]({remote_url if remote_url else match.group(2)})"
             return match.group(0)
 
-        return pattern.sub(replacer, md_content)
+        return _IMAGE_REF_RE.sub(replacer, md_content)
 
 
 class MarkDownToImgNode(BaseNode):
@@ -605,8 +635,8 @@ class MarkDownToImgNode(BaseNode):
 
         # 3. 操作_vlm_summarizer
         self.log_step("step3", "利用VLM提取摘要")
-        summaries: Dict[str, str] = self._vlm_summarizer._summary_all(md_path_obj.stem, img_info_list,
-                                                                      config.vl_model)
+        summaries: Dict[str, str] = self._vlm_summarizer.summarize_all(md_path_obj.stem, img_info_list,
+                                                                       config.vl_model)
 
         # 4. 操作_img_uploader
         self.log_step("step4", "上传文件到MinIO,且更新MD")

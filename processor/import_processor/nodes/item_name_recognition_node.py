@@ -103,7 +103,7 @@ class ItemNameRecognitionNode(BaseNode):
             # 1.2 获取chunk的content
             content = chunk.get('content')
 
-            splice_context = f"【切片】- f{index}- {content}"
+            splice_context = f"【切片】- {index} - {content}"
 
             final_context.append(splice_context)
 
@@ -132,8 +132,8 @@ class ItemNameRecognitionNode(BaseNode):
                 HumanMessage(content=user_prompt)
             ])
 
-            # 4. 获取AI回复的具体内容
-            llm_result = llm_response.content.strip('')
+            # 4. 获取AI回复的具体内容（strip('')语义怪异：传空字符集等于不别除任何字符，意图就是strip()）
+            llm_result = llm_response.content.strip()
             if not llm_result or llm_result == 'UNKNOWN':
                 self.logger.error(f"LLM提取商品名失败，降级使用文件标题{file_title}作为商品名兜底")
                 return file_title
@@ -232,10 +232,11 @@ class ItemNameRecognitionNode(BaseNode):
             }
             # 7. 插入数据
             inserted_result = milvus_client.insert(collection_name=item_name_collection_name, data=[item_name_data_row])
+            self.logger.info(f"插入的结果:{inserted_result},主键值:{inserted_result.get('ids')}")
         except Exception as e:
+            # 日志移入 try 内：插入抛异常时 inserted_result 未定义，
+            # 原先在 except 之后访问会触发 UnboundLocalError
             self.logger.error(f"商品名{item_name}插入失败 {str(e)}")
-
-        self.logger.info(f"插入的结果:{inserted_result},主键值:{inserted_result.get('ids')}")
 
     def _create_item_name_collection(self, item_name_collection_name: str, milvus_client: MilvusClient):
         """
@@ -250,7 +251,9 @@ class ItemNameRecognitionNode(BaseNode):
         # 1. 创建schema约束
         schema = milvus_client.create_schema()
         # 1.1 创建主键字段约束
-        schema.add_field(field_name="pk", datatype=DataType.VARCHAR, is_primary=True, auto_id=True, max_length=10)
+        # Milvus 的 auto_id 自增主键仅支持 INT64；VARCHAR 主键设置 auto_id
+        # 会在创建集合时直接报错，且 max_length 对自增主键无意义
+        schema.add_field(field_name="pk", datatype=DataType.INT64, is_primary=True, auto_id=True)
 
         # 1.2 创建标量字段的约束
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
