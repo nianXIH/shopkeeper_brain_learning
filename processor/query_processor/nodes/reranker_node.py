@@ -185,7 +185,6 @@ class RerankerNode(BaseNode):
         upper_bound = min(rerank_max_top_k, len(refine_docs))
         lower_bound = min(rerank_min_top_k, upper_bound)
         cut_off = upper_bound
-        max_gap = 0
 
         # 1. 绝对阈值裁剪: 分数已降序, 从头找第一个分数低于绝对阈值的文档
         for i, doc in enumerate(refine_docs[:upper_bound]):
@@ -195,7 +194,7 @@ class RerankerNode(BaseNode):
                 self.logger.info(f"位置{i}分数{score:.4f}低于绝对阈值{rerank_gap_abs}发生裁剪")
                 break
 
-        # 2. 相对阈值裁剪: 找相对降幅达标的全局最大断崖
+        # 2. 相对阈值裁剪: 分数已降序, 找到第一个相对降幅达标的断崖即截断
         for i in range(0, upper_bound - 1):
             current_score = refine_docs[i].get('score')
             next_score = refine_docs[i + 1].get('score')
@@ -206,10 +205,10 @@ class RerankerNode(BaseNode):
             gap = current_score - next_score
             ratio = gap / current_score
 
-            if ratio >= rerank_gap_ratio and gap > max_gap:
-                max_gap = gap
+            if ratio >= rerank_gap_ratio:
                 cut_off = min(cut_off, i + 1)
                 self.logger.info(f"位置{i + 1}发生相对断崖(相对降幅{ratio:.2%})")
+                break
 
         # 兜底：不管如何裁剪，至少保留 lower_bound 个
         cut_off = max(cut_off, lower_bound)
